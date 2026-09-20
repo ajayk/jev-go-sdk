@@ -55,8 +55,9 @@ type ScoreAnswer struct {
 	// [0, len(levels)-1].
 	Score float64
 	// Legend maps each level index ("0", "1", ...) to the level's
-	// description as the API rendered it.
-	Legend map[string]string
+	// description as the API rendered it: a string, or a JSON object or
+	// array when the rubric was given structured descriptions.
+	Legend map[string]Content
 	// Probabilities holds one probability per rubric level, keyed by level
 	// index as in Legend.
 	Probabilities map[string]float64
@@ -95,7 +96,7 @@ type wireAnswer struct {
 	Noul          *float64           `json:"noul"`
 	Choice        string             `json:"choice"`
 	Score         *float64           `json:"score"`
-	Legend        map[string]string  `json:"legend"`
+	Legend        map[string]Content `json:"legend"`
 	Probabilities map[string]float64 `json:"probabilities"`
 	Confidence    *float64           `json:"confidence"`
 }

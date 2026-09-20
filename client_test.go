@@ -4,13 +4,14 @@
 package jev
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -19,7 +20,10 @@ import (
 )
 
 func fastRetry(maxRetries int) RetryPolicy {
-	return RetryPolicy{MaxRetries: maxRetries, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+	p := DefaultRetryPolicy()
+	p.MaxRetries = maxRetries
+	p.BaseDelay, p.MaxDelay, p.Jitter = time.Millisecond, time.Millisecond, 0
+	return p
 }
 
 func sampleRequest() Request {
@@ -50,7 +54,7 @@ func newServer(t *testing.T, handler http.HandlerFunc, opts ...Option) *Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	opts = append([]Option{WithAPIKey("sk-test-" + t.Name()), WithEndpoint(srv.URL), WithHTTPClient(srv.Client()), WithRetryPolicy(fastRetry(0))}, opts...)
+	opts = append([]Option{WithAPIKey("sk-test-" + t.Name()), WithBaseURL(srv.URL + "/"), WithHTTPClient(srv.Client()), WithRetryPolicy(fastRetry(0))}, opts...)
 	client, err := NewClient(opts...)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -62,21 +66,41 @@ func TestAskRoundTrip(t *testing.T) {
 	t.Parallel()
 	var gotBody []byte
 	var gotHeader http.Header
+	var gotPath string
 	client := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
 		gotHeader = r.Header.Clone()
 		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set(RequestIDHeader, "req-123")
 		_, _ = w.Write([]byte(sampleBody(sampleAnswers)))
-	})
+	}, WithHeaders(map[string]string{"X-Team": "sentinel", "Authorization": "forged"}))
 
-	resp, err := client.Ask(t.Context(), sampleRequest())
+	req := sampleRequest()
+	req.Headers = map[string]string{"X-Call": "one", "User-Agent": "forged"}
+	req.Extra = map[string]any{"debug": true}
+	resp, err := client.Ask(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Ask: %v", err)
 	}
-	if got, want := gotHeader.Get("Authorization"), "Bearer sk-test-"+t.Name(); got != want {
-		t.Errorf("Authorization: got = %q, want = %q", got, want)
+	if gotPath != SystemOnePath {
+		t.Errorf("path: got = %q, want = %q", gotPath, SystemOnePath)
 	}
-	if got := gotHeader.Get("User-Agent"); !strings.HasPrefix(got, "jev-go-sdk") {
-		t.Errorf("User-Agent: got = %q", got)
+	for k, want := range map[string]string{
+		"Authorization":      "Bearer sk-test-" + t.Name(),
+		"User-Agent":         sdkIdentity,
+		"X-Typesafe-Sdk":     sdkIdentity,
+		"X-Typesafe-Runtime": runtimeIdentity,
+		"Content-Type":       "application/json",
+		"Accept":             "application/json",
+		"X-Team":             "sentinel",
+		"X-Call":             "one",
+	} {
+		if got := gotHeader.Get(k); got != want {
+			t.Errorf("header %s: got = %q, want = %q", k, got, want)
+		}
+	}
+	if gotHeader.Get("X-Typesafe-Retry-Count") != "" {
+		t.Errorf("first attempt carries a retry count: %q", gotHeader.Get("X-Typesafe-Retry-Count"))
 	}
 
 	var wire map[string]any
@@ -86,6 +110,7 @@ func TestAskRoundTrip(t *testing.T) {
 	wantWire := map[string]any{
 		"model": "jev-latest",
 		"state": "The install script downloads and executes a remote binary.",
+		"debug": true,
 		"questions": map[string]any{
 			"exfil": map[string]any{"type": "noul", "instructions": "Does the state describe data exfiltration?"},
 			"kind": map[string]any{"type": "choice", "instructions": "Classify the behavior.",
@@ -98,13 +123,14 @@ func TestAskRoundTrip(t *testing.T) {
 	}
 
 	want := &Response{
-		Model: "jev-1.13.0",
-		Usage: Usage{InputTokens: 120, OutputTokens: 3},
+		Model:     "jev-1.13.0",
+		Usage:     Usage{InputTokens: 120, OutputTokens: 3},
+		RequestID: "req-123",
 		Answers: map[string]Answer{
 			"exfil": NoulAnswer{Probability: 0.91},
 			"kind": ChoiceAnswer{Choice: "malicious",
 				Probabilities: map[string]float64{"benign": 0.02, "suspicious": 0.18, "malicious": 0.80}, Confidence: 0.77},
-			"severity": ScoreAnswer{Score: 1.6, Legend: map[string]string{"0": "none", "1": "low", "2": "high"},
+			"severity": ScoreAnswer{Score: 1.6, Legend: map[string]Content{"0": "none", "1": "low", "2": "high"},
 				Probabilities: map[string]float64{"0": 0.1, "1": 0.2, "2": 0.7}, Confidence: 0.65},
 		},
 	}
@@ -112,12 +138,10 @@ func TestAskRoundTrip(t *testing.T) {
 		t.Errorf("response:\n got: %+v\nwant: %+v", resp, want)
 	}
 
-	noul, err := resp.Noul("exfil")
-	if err != nil || noul.Probability != 0.91 {
+	if noul, err := resp.Noul("exfil"); err != nil || noul.Probability != 0.91 {
 		t.Errorf("Noul(exfil): got = (%v, %v)", noul, err)
 	}
-	choice, err := resp.Choice("kind")
-	if err != nil || choice.Choice != "malicious" {
+	if choice, err := resp.Choice("kind"); err != nil || choice.Choice != "malicious" {
 		t.Errorf("Choice(kind): got = (%v, %v)", choice, err)
 	}
 	score, err := resp.Score("severity")
@@ -130,24 +154,56 @@ func TestAskRoundTrip(t *testing.T) {
 	if _, err := resp.Choice("exfil"); !errors.Is(err, ErrNoAnswer) {
 		t.Errorf("Choice(exfil) on a noul: got = %v, want ErrNoAnswer", err)
 	}
-	if _, err := resp.Noul("nope"); !errors.Is(err, ErrNoAnswer) {
-		t.Errorf("Noul(nope): got = %v, want ErrNoAnswer", err)
+	if len(resp.Nouls()) != 1 || len(resp.Choices()) != 1 || len(resp.Scores()) != 1 {
+		t.Errorf("grouped accessors: nouls=%d choices=%d scores=%d, want 1 each", len(resp.Nouls()), len(resp.Choices()), len(resp.Scores()))
 	}
 }
 
-func TestAskAcceptsPointerQuestions(t *testing.T) {
+func TestAskRawReturnsUndecodedBody(t *testing.T) {
+	t.Parallel()
+	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(RequestIDHeader, "raw-1")
+		_, _ = w.Write([]byte(`{"model":"jev-1.13.0","answers":{"exfil":{"type":"noul","noul":0.5,"future_field":1}},"usage":{"input_tokens":1,"output_tokens":1}}`))
+	})
+	req := Request{State: "s", Questions: map[string]Question{"exfil": Noul{}}}
+	body, requestID, err := client.AskRaw(t.Context(), req)
+	if err != nil {
+		t.Fatalf("AskRaw: %v", err)
+	}
+	if requestID != "raw-1" || !bytes.Contains(body, []byte("future_field")) {
+		t.Errorf("AskRaw: got id=%q body=%s", requestID, body)
+	}
+}
+
+func TestAskAcceptsPointerAndRawQuestions(t *testing.T) {
 	t.Parallel()
 	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(sampleBody(sampleAnswers)))
 	})
 	req := sampleRequest()
 	req.Questions = map[string]Question{
-		"exfil":    &Noul{Instructions: "?"},
-		"kind":     &Choice{Instructions: "?", Options: req.Questions["kind"].(Choice).Options},
-		"severity": &Score{Instructions: "?", Levels: req.Questions["severity"].(Score).Levels},
+		"exfil": &Noul{Instructions: "?"},
+		"kind": Raw{"type": "choice", "instructions": "?",
+			"criteria": map[string]any{"benign": nil, "suspicious": "warrants review", "malicious": "clearly hostile"}},
+		"severity": Raw{"type": "score", "criteria": []any{"none", "low", "high"}},
 	}
-	if _, err := client.Ask(t.Context(), req); err != nil {
+	resp, err := client.Ask(t.Context(), req)
+	if err != nil {
 		t.Fatalf("Ask: %v", err)
+	}
+	if _, err := resp.Score("severity"); err != nil {
+		t.Errorf("Score(severity): %v", err)
+	}
+}
+
+func TestRawQuestionMarshalsAsGiven(t *testing.T) {
+	t.Parallel()
+	got, err := json.Marshal(Raw{"type": "noul", "instructions": "?", "criteria": map[string]any{"true": "yes"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"criteria":{"true":"yes"},"instructions":"?","type":"noul"}`; string(got) != want {
+		t.Errorf("Marshal(Raw): got = %s, want = %s", got, want)
 	}
 }
 
@@ -155,18 +211,23 @@ func TestAskRejectsInvalidRequestBeforeSending(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	client := newServer(t, func(http.ResponseWriter, *http.Request) { calls.Add(1) })
-	q := map[string]Question{"q": Noul{Instructions: "i"}}
+	q := map[string]Question{"q": Noul{}}
 	tests := []struct {
 		name string
 		req  Request
 	}{
 		{"nil state", Request{Questions: q}},
 		{"no questions", Request{State: "s"}},
-		{"empty id", Request{State: "s", Questions: map[string]Question{"": Noul{Instructions: "i"}}}},
+		{"empty id", Request{State: "s", Questions: map[string]Question{"": Noul{}}}},
 		{"nil question", Request{State: "s", Questions: map[string]Question{"q": nil}}},
 		{"nil pointer question", Request{State: "s", Questions: map[string]Question{"q": (*Noul)(nil)}}},
-		{"one option", Request{State: "s", Questions: map[string]Question{"q": Choice{Instructions: "i", Options: map[string]Content{"a": nil}}}}},
-		{"one level", Request{State: "s", Questions: map[string]Question{"q": Score{Instructions: "i", Levels: []Content{"a"}}}}},
+		{"no options", Request{State: "s", Questions: map[string]Question{"q": Choice{}}}},
+		{"no levels", Request{State: "s", Questions: map[string]Question{"q": Score{}}}},
+		{"raw without type", Request{State: "s", Questions: map[string]Question{"q": Raw{"instructions": "?"}}}},
+		{"raw unknown type", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "rank"}}}},
+		{"raw choice without criteria", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "choice"}}}},
+		{"raw score criteria not array", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "score", "criteria": map[string]any{}}}}},
+		{"bad per-call retry", Request{State: "s", Questions: q, Retry: &RetryPolicy{Jitter: 2}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -183,32 +244,25 @@ func TestAskRejectsInvalidRequestBeforeSending(t *testing.T) {
 	})
 }
 
-func TestAskRetriesTransientStatusesAndHonorsRetryAfter(t *testing.T) {
+func TestAskRetriesTransientStatuses(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
+	var retryCounts []string
 	statuses := []int{http.StatusTooManyRequests, StatusOverloaded}
-	var retries []struct {
-		attempt int
-		delay   time.Duration
-	}
+	var retries []int
 	policy := fastRetry(len(statuses))
-	policy.OnRetry = func(attempt int, _ error, delay time.Duration) {
-		retries = append(retries, struct {
-			attempt int
-			delay   time.Duration
-		}{attempt, delay})
-	}
-	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+	policy.OnRetry = func(attempt int, _ error, _ time.Duration) { retries = append(retries, attempt) }
+	var logs bytes.Buffer
+	client := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		retryCounts = append(retryCounts, r.Header.Get("X-Typesafe-Retry-Count"))
 		n := int(calls.Add(1)) - 1
 		if n < len(statuses) {
-			if n == 0 {
-				w.Header().Set("Retry-After", "0")
-			}
+			w.Header().Set("Retry-After-Ms", "1")
 			w.WriteHeader(statuses[n])
 			return
 		}
 		_, _ = w.Write([]byte(sampleBody(sampleAnswers)))
-	}, WithRetryPolicy(policy))
+	}, WithRetryPolicy(policy), WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
 
 	if _, err := client.Ask(t.Context(), sampleRequest()); err != nil {
 		t.Fatalf("Ask: %v", err)
@@ -216,30 +270,51 @@ func TestAskRetriesTransientStatusesAndHonorsRetryAfter(t *testing.T) {
 	if got := calls.Load(); got != int32(len(statuses)+1) {
 		t.Errorf("attempts: got = %d, want = %d", got, len(statuses)+1)
 	}
-	if len(retries) != 2 || retries[0].attempt != 1 || retries[1].attempt != 2 {
-		t.Errorf("OnRetry calls: got = %+v", retries)
+	if !reflect.DeepEqual(retries, []int{1, 2}) {
+		t.Errorf("OnRetry attempts: got = %v, want = [1 2]", retries)
+	}
+	if !reflect.DeepEqual(retryCounts, []string{"", "1", "2"}) {
+		t.Errorf("X-Typesafe-Retry-Count per attempt: got = %q", retryCounts)
+	}
+	if s := logs.String(); !strings.Contains(s, "jev: retrying") || strings.Contains(s, "sk-test-") || strings.Contains(s, "install script") {
+		t.Errorf("logs: want retry entries without key or state, got:\n%s", s)
 	}
 }
 
-func TestRetryPolicyDelay(t *testing.T) {
+func TestAskPerCallRetryOverride(t *testing.T) {
 	t.Parallel()
-	p := RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second}
-	for _, tt := range []struct {
-		attempt    int
-		retryAfter time.Duration
-		want       time.Duration
-	}{
-		{0, 0, 100 * time.Millisecond},
-		{1, 0, 200 * time.Millisecond},
-		{2, 0, 400 * time.Millisecond},
-		{3, 0, 800 * time.Millisecond},
-		{4, 0, time.Second},
-		{50, 0, time.Second},
-		{0, 3 * time.Second, 3 * time.Second},
-	} {
-		if got := p.delay(tt.attempt, tt.retryAfter); got != tt.want {
-			t.Errorf("delay(%d, %v): got = %v, want = %v", tt.attempt, tt.retryAfter, got, tt.want)
-		}
+	var calls atomic.Int32
+	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}, WithRetryPolicy(fastRetry(3)))
+	req := sampleRequest()
+	req.Retry = &RetryPolicy{}
+	if _, err := client.Ask(t.Context(), req); !errors.Is(err, ErrServer) {
+		t.Errorf("Ask error: got = %v, want ErrServer", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("attempts with retries disabled per call: got = %d, want = 1", got)
+	}
+}
+
+func TestAskRespectsRetryBudget(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	policy := fastRetry(5)
+	policy.Budget = 10 * time.Second
+	client.retry = policy
+	// Retry-After of 60s exceeds the 10s budget, so no retry is attempted.
+	if _, err := client.Ask(t.Context(), sampleRequest()); !errors.Is(err, ErrRateLimited) {
+		t.Errorf("Ask error: got = %v, want ErrRateLimited", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("attempts: got = %d, want = 1", got)
 	}
 }
 
@@ -247,23 +322,42 @@ func TestAskSurfacesAPIError(t *testing.T) {
 	t.Parallel()
 	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "7")
+		w.Header().Set(RequestIDHeader, "req-9")
 		w.WriteHeader(StatusOverloaded)
-		_, _ = w.Write([]byte("{\"error\":\"overloaded\n\x1b[31m\"}"))
+		_, _ = w.Write([]byte(`{"error":"overloaded"}`))
 	})
 	_, err := client.Ask(t.Context(), sampleRequest())
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("Ask error: got = %v, want *APIError", err)
 	}
-	want := &APIError{StatusCode: StatusOverloaded, Body: `{"error":"overloaded [31m"}`, RetryAfter: 7 * time.Second}
-	if !reflect.DeepEqual(want, apiErr) {
-		t.Errorf("APIError: got = %+v, want = %+v", apiErr, want)
+	if apiErr.StatusCode != StatusOverloaded || apiErr.RetryAfter != 7*time.Second || apiErr.RequestID != "req-9" || apiErr.Endpoint != "POST /v1/systemone" {
+		t.Errorf("APIError fields: %+v", apiErr)
 	}
-	if got, want := err.Error(), `jev: HTTP 529 Overloaded: {"error":"overloaded [31m"}`; got != want {
-		t.Errorf("Error(): got = %q, want = %q", got, want)
+	if want := `jev: POST /v1/systemone: HTTP 529 Overloaded: overloaded (request_id=req-9)`; err.Error() != want {
+		t.Errorf("Error(): got = %q, want = %q", err.Error(), want)
+	}
+	if !errors.Is(err, ErrServer) || errors.Is(err, ErrRateLimited) {
+		t.Errorf("status class: ErrServer=%v ErrRateLimited=%v", errors.Is(err, ErrServer), errors.Is(err, ErrRateLimited))
 	}
 	if strings.Contains(err.Error(), "sk-test-") {
 		t.Errorf("error leaks the API key: %q", err.Error())
+	}
+}
+
+func TestAPIErrorStatusClasses(t *testing.T) {
+	t.Parallel()
+	for status, want := range map[int]error{
+		400: ErrBadRequest, 401: ErrUnauthorized, 403: ErrForbidden, 404: ErrNotFound,
+		422: ErrUnprocessable, 429: ErrRateLimited, 500: ErrServer, 529: ErrServer,
+	} {
+		err := error(&APIError{StatusCode: status})
+		if !errors.Is(err, want) {
+			t.Errorf("status %d: errors.Is(%v) = false", status, want)
+		}
+	}
+	if errors.Is(&APIError{StatusCode: 418}, ErrBadRequest) {
+		t.Error("418 matched ErrBadRequest")
 	}
 }
 
@@ -272,11 +366,16 @@ func TestAskDoesNotRetryClientErrors(t *testing.T) {
 	var calls atomic.Int32
 	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
-		http.Error(w, `{"detail":"bad"}`, http.StatusUnprocessableEntity)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"detail":[{"loc":["body","questions","urgency","criteria"],"msg":"Field required","type":"missing"}]}`))
 	}, WithRetryPolicy(fastRetry(3)))
 	_, err := client.Ask(t.Context(), sampleRequest())
-	if IsRetryable(err) {
-		t.Errorf("IsRetryable: got = true, want = false (%v)", err)
+	if !errors.Is(err, ErrUnprocessable) {
+		t.Errorf("Ask error: got = %v, want ErrUnprocessable", err)
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Message != "questions.urgency.criteria: Field required" {
+		t.Errorf("Message: got = %q", apiErr.Message)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("attempts: got = %d, want = 1", got)
@@ -318,11 +417,25 @@ func TestAskValidatesAnswersAgainstQuestions(t *testing.T) {
 			client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte(sampleBody(tt.answers)))
 			})
-			_, err := client.Ask(t.Context(), sampleRequest())
-			if !errors.Is(err, ErrResponseValidation) {
+			if _, err := client.Ask(t.Context(), sampleRequest()); !errors.Is(err, ErrResponseValidation) {
 				t.Errorf("Ask error: got = %v, want ErrResponseValidation", err)
 			}
 		})
+	}
+}
+
+func TestAskAcceptsStructuredLegendAndSingleLevel(t *testing.T) {
+	t.Parallel()
+	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"model":"m","answers":{"s":{"type":"score","score":0,"legend":{"0":{"label":"only"}},"probabilities":{"0":1},"confidence":0.9}},"usage":{}}`))
+	})
+	resp, err := client.Ask(t.Context(), Request{State: "s", Questions: map[string]Question{"s": Score{Levels: []Content{map[string]any{"label": "only"}}}}})
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	score, _ := resp.Score("s")
+	if legend, ok := score.Legend["0"].(map[string]any); !ok || legend["label"] != "only" {
+		t.Errorf("structured legend: got = %#v", score.Legend["0"])
 	}
 }
 
@@ -352,9 +465,7 @@ func TestAskRetriesHTTPTimeoutWhileCallerContextLive(t *testing.T) {
 		_, _ = w.Write([]byte(sampleBody(sampleAnswers)))
 	}))
 	t.Cleanup(srv.Close)
-	httpClient := srv.Client()
-	httpClient.Timeout = 200 * time.Millisecond
-	client, err := NewClient(WithAPIKey("k"), WithEndpoint(srv.URL), WithHTTPClient(httpClient), WithRetryPolicy(fastRetry(1)))
+	client, err := NewClient(WithAPIKey("k"), WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithTimeout(200*time.Millisecond), WithRetryPolicy(fastRetry(1)))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -363,6 +474,36 @@ func TestAskRetriesHTTPTimeoutWhileCallerContextLive(t *testing.T) {
 	}
 	if got := calls.Load(); got != 2 {
 		t.Errorf("attempts: got = %d, want = 2", got)
+	}
+}
+
+func TestAskClassifiesTimeoutAndConnectionErrors(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+	client := newServer(t, func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}, WithTimeout(100*time.Millisecond))
+	_, err := client.Ask(t.Context(), sampleRequest())
+	if !errors.Is(err, ErrTimeout) || !errors.Is(err, ErrConnection) {
+		t.Errorf("timeout classification: got = %v", err)
+	}
+
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+	refused, err := NewClient(WithAPIKey("k"), WithBaseURL(srv.URL), WithRetryPolicy(RetryPolicy{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = refused.Ask(t.Context(), sampleRequest())
+	if !errors.Is(err, ErrConnection) || errors.Is(err, ErrTimeout) {
+		t.Errorf("connection classification: got = %v", err)
+	}
+	if !DefaultRetryPolicy().retryable(err) {
+		t.Error("default policy does not retry a connection error")
 	}
 }
 
@@ -405,57 +546,69 @@ func TestAskStopsWhenContextCanceledDuringBackoff(t *testing.T) {
 	}
 }
 
-type timeoutErr struct{}
-
-func (timeoutErr) Error() string   { return "i/o timeout" }
-func (timeoutErr) Timeout() bool   { return true }
-func (timeoutErr) Temporary() bool { return true }
-
-func TestIsRetryable(t *testing.T) {
+func TestListModels(t *testing.T) {
 	t.Parallel()
-	for _, tt := range []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"nil", nil, false},
-		{"429", &APIError{StatusCode: 429}, true},
-		{"408", &APIError{StatusCode: 408}, true},
-		{"500", &APIError{StatusCode: 500}, true},
-		{"529", &APIError{StatusCode: StatusOverloaded}, true},
-		{"401", &APIError{StatusCode: 401}, false},
-		{"422", &APIError{StatusCode: 422}, false},
-		{"validation", validationError("bad"), false},
-		{"canceled", context.Canceled, false},
-		{"deadline", context.DeadlineExceeded, false},
-		{"http client timeout", &url.Error{Op: "Post", Err: timeoutErr{}}, true},
-		{"http deadline mid-request", &url.Error{Op: "Post", Err: context.DeadlineExceeded}, true},
-		{"http canceled", &url.Error{Op: "Post", Err: context.Canceled}, false},
-		{"http refused", &url.Error{Op: "Post", Err: errors.New("refused")}, false},
-	} {
-		if got := IsRetryable(tt.err); got != tt.want {
-			t.Errorf("IsRetryable(%s): got = %v, want = %v", tt.name, got, tt.want)
+	client := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != ModelsPath || r.Header.Get("Content-Type") != "" {
+			http.Error(w, "bad request shape", http.StatusBadRequest)
+			return
 		}
+		w.Header().Set(RequestIDHeader, "m-1")
+		_, _ = w.Write([]byte(`{"models":[{"name":"jev-latest","description":"General-purpose system one model.","release_date":"2026-09-15"}]}`))
+	})
+	list, err := client.ListModels(t.Context())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	want := &ModelList{RequestID: "m-1", Models: []ModelMetadata{{Name: "jev-latest", Description: "General-purpose system one model.", ReleaseDate: "2026-09-15"}}}
+	if !reflect.DeepEqual(want, list) {
+		t.Errorf("ListModels: got = %+v, want = %+v", list, want)
 	}
 }
 
-func TestNewClientReadsKeyFromEnvironment(t *testing.T) {
-	t.Setenv(APIKeyEnv, "")
+func TestListModelsRejectsMalformedBody(t *testing.T) {
+	t.Parallel()
+	client := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"models":[{"description":"no name"}]}`))
+	})
+	if _, err := client.ListModels(t.Context()); !errors.Is(err, ErrResponseValidation) {
+		t.Errorf("ListModels error: got = %v, want ErrResponseValidation", err)
+	}
+}
+
+func TestNewClientEnvironment(t *testing.T) {
+	t.Setenv(APIKeyEnv, " ")
+	t.Setenv(BaseURLEnv, "")
+	t.Setenv(DefaultModelEnv, "")
 	if _, err := NewClient(); err == nil {
-		t.Error("NewClient with no key: got nil error")
+		t.Error("NewClient with blank key: got nil error")
 	}
 	t.Setenv(APIKeyEnv, "sk-env")
+	t.Setenv(BaseURLEnv, "https://proxy.example/")
+	t.Setenv(DefaultModelEnv, " jev-preview ")
 	client, err := NewClient()
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	if client.apiKey != "sk-env" || client.model != ModelJevLatest || client.endpoint != DefaultEndpoint {
-		t.Errorf("defaults: %+v", client)
+	if client.apiKey != "sk-env" || client.baseURL != "https://proxy.example" || client.model != "jev-preview" || client.httpClient.Timeout != DefaultTimeout {
+		t.Errorf("env defaults: key=%q base=%q model=%q timeout=%v", client.apiKey, client.baseURL, client.model, client.httpClient.Timeout)
+	}
+	explicit, err := NewClient(WithAPIKey("sk-opt"), WithBaseURL("http://127.0.0.1:1"), WithModel("jev-1.13.0"))
+	if err != nil {
+		t.Fatalf("NewClient explicit: %v", err)
+	}
+	if explicit.apiKey != "sk-opt" || explicit.baseURL != "http://127.0.0.1:1" || explicit.model != "jev-1.13.0" {
+		t.Errorf("options should win over env: %+v", explicit)
+	}
+	t.Setenv(BaseURLEnv, "not a url")
+	if _, err := NewClient(); err == nil {
+		t.Error("NewClient with invalid base url env: got nil error")
 	}
 }
 
 func TestNewClientOptions(t *testing.T) {
 	t.Parallel()
+	shared := &http.Client{Timeout: time.Minute}
 	for _, tt := range []struct {
 		name    string
 		opts    []Option
@@ -464,11 +617,14 @@ func TestNewClientOptions(t *testing.T) {
 		{"explicit key", []Option{WithAPIKey("k")}, false},
 		{"empty key", []Option{WithAPIKey("")}, true},
 		{"empty model", []Option{WithAPIKey("k"), WithModel("")}, true},
-		{"relative endpoint", []Option{WithAPIKey("k"), WithEndpoint("/v1")}, true},
-		{"ftp endpoint", []Option{WithAPIKey("k"), WithEndpoint("ftp://x/y")}, true},
+		{"relative base url", []Option{WithAPIKey("k"), WithBaseURL("/v1")}, true},
+		{"ftp base url", []Option{WithAPIKey("k"), WithBaseURL("ftp://x/y")}, true},
 		{"nil http client", []Option{WithAPIKey("k"), WithHTTPClient(nil)}, true},
+		{"zero timeout", []Option{WithAPIKey("k"), WithTimeout(0)}, true},
 		{"negative retries", []Option{WithAPIKey("k"), WithRetryPolicy(RetryPolicy{MaxRetries: -1})}, true},
+		{"jitter above one", []Option{WithAPIKey("k"), WithRetryPolicy(RetryPolicy{Jitter: 1.5})}, true},
 		{"zero size cap", []Option{WithAPIKey("k"), WithMaxResponseBytes(0)}, true},
+		{"shared client with timeout override", []Option{WithAPIKey("k"), WithHTTPClient(shared), WithTimeout(time.Second)}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -477,44 +633,7 @@ func TestNewClientOptions(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestQuestionMarshalJSON(t *testing.T) {
-	t.Parallel()
-	for _, tt := range []struct {
-		question Question
-		want     string
-	}{
-		{Noul{Instructions: "Is it raining?"}, `{"type":"noul","instructions":"Is it raining?"}`},
-		{Noul{Instructions: "Is it raining?", True: "wet"}, `{"type":"noul","instructions":"Is it raining?","criteria":{"true":"wet"}}`},
-		{Choice{Instructions: "Pick.", Options: map[string]Content{"a": nil, "b": "second"}}, `{"type":"choice","instructions":"Pick.","criteria":{"a":null,"b":"second"}}`},
-		{Score{Instructions: "Rate.", Levels: []Content{"low", "high"}}, `{"type":"score","instructions":"Rate.","criteria":["low","high"]}`},
-	} {
-		got, err := json.Marshal(tt.question)
-		if err != nil {
-			t.Fatalf("Marshal: %v", err)
-		}
-		if string(got) != tt.want {
-			t.Errorf("Marshal(%T): got = %s, want = %s", tt.question, got, tt.want)
-		}
-	}
-}
-
-func TestScoreAnswerLevel(t *testing.T) {
-	t.Parallel()
-	for _, tt := range []struct {
-		probabilities map[string]float64
-		wantLevel     int
-		wantP         float64
-	}{
-		{nil, -1, 0},
-		{map[string]float64{"0": 1}, 0, 1},
-		{map[string]float64{"0": 0.1, "1": 0.6, "2": 0.3}, 1, 0.6},
-		{map[string]float64{"2": 0.5, "1": 0.5}, 1, 0.5},
-	} {
-		level, p := (ScoreAnswer{Probabilities: tt.probabilities}).Level()
-		if level != tt.wantLevel || p != tt.wantP {
-			t.Errorf("Level(%v): got = (%d, %v), want = (%d, %v)", tt.probabilities, level, p, tt.wantLevel, tt.wantP)
-		}
+	if shared.Timeout != time.Minute {
+		t.Errorf("WithTimeout mutated the caller's http.Client: %v", shared.Timeout)
 	}
 }

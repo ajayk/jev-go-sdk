@@ -1,7 +1,8 @@
 # jev-go-sdk
 
-A dependency-free Go client for [TypeSafe AI](https://typesafe.ai)'s System One
-API and its flagship model, **Jev**.
+A dependency-free Go client for [TypeSafe AI](https://typesafe.ai)'s API and
+its flagship System One model, **Jev**. It mirrors the feature surface of the
+official Python and JavaScript SDKs.
 
 Jev is not a chat model. You send it a *state* (text or JSON) and a set of
 *typed questions*; it returns one calibrated, probability-bearing answer per
@@ -16,8 +17,10 @@ Requires Go 1.26 or newer. Only the standard library is used.
 
 ## Quick start
 
+Set `TYPESAFE_API_KEY`, then:
+
 ```go
-client, err := jev.NewClient() // reads TYPESAFE_API_KEY
+client, err := jev.NewClient()
 if err != nil {
     log.Fatal(err)
 }
@@ -31,7 +34,7 @@ resp, err := client.Ask(ctx, jev.Request{
             Options: map[string]jev.Content{
                 "billing": "payments, charges, refunds",
                 "support": "product issues and how-to questions",
-                "sales":   "new purchases and upgrades",
+                "sales":   nil, // a nil description is interpreted by its name alone
             },
         },
         "urgency": jev.Score{
@@ -50,81 +53,105 @@ urgency, _ := resp.Score("urgency") // urgency.Score, urgency.Level(), urgency.L
 ```
 
 Every question in a request is evaluated independently against the same state,
-so ask several at once rather than chaining calls.
+so ask several at once rather than chaining calls. `resp.Nouls()`,
+`resp.Choices()`, and `resp.Scores()` return the answers grouped by kind.
 
 ## Question types
 
 | Type | Ask | Get back |
 | --- | --- | --- |
-| `jev.Noul` | a yes/no question, with optional descriptions of what yes and no mean | `NoulAnswer{Probability}`: the probability of yes |
-| `jev.Choice` | pick one label from a described set (two or more labels) | `ChoiceAnswer{Choice, Probabilities, Confidence}` |
-| `jev.Score` | rate the state on an ordered rubric (two or more levels, lowest first) | `ScoreAnswer{Score, Probabilities, Legend, Confidence}`; `Level()` gives the most probable level index |
+| `jev.Noul` | a yes/no question or statement, with optional descriptions of what yes and no mean | `NoulAnswer{Probability}`: the probability of yes |
+| `jev.Choice` | pick one label from a described set (up to 255) | `ChoiceAnswer{Choice, Probabilities, Confidence}` |
+| `jev.Score` | rate the state on an ordered rubric, lowest level first | `ScoreAnswer{Score, Probabilities, Legend, Confidence}`; `Level()` gives the most probable level index |
+| `jev.Raw` | a question as a plain JSON object with a `"type"` key, for dynamically built questions | the answer for whichever type it names |
 
-`Instructions`, option descriptions, and rubric levels accept a Go string or any
-value that marshals to a JSON object or array (`jev.Content`). The same goes
-for `State`.
-
-## Errors
-
-- Requests are validated before they are sent; problems wrap `jev.ErrInvalidRequest`.
-- Every non-2xx status is a `*jev.APIError` with `StatusCode`, a bounded
-  control-character-free `Body` excerpt, and any `RetryAfter` hint. The API
-  documents 401, 422, 429, and 529 (`jev.StatusOverloaded`).
-- A 2xx body is checked against the questions you sent. A missing answer, an
-  answer for a question you did not ask, a mismatched kind, an undeclared
-  label, an incomplete distribution, or an out-of-range probability, score, or
-  confidence wraps `jev.ErrResponseValidation`. The client fails closed rather
-  than handing you partial data.
-- Bodies above the cap (16 MiB by default) wrap `jev.ErrResponseTooLarge`.
-- `jev.IsRetryable(err)` reports whether an error is transient.
-
-## Retries
-
-Transient failures (408, 429, 5xx, 529, and HTTP client or transport timeouts)
-are retried with exponential backoff and jitter, honouring a `Retry-After`
-header when it is longer than the computed delay. The default policy makes two
-retries starting at 500 ms. Retrying stops as soon as your context is done.
-
-```go
-client, _ := jev.NewClient(jev.WithRetryPolicy(jev.RetryPolicy{
-    MaxRetries: 4,
-    BaseDelay:  250 * time.Millisecond,
-    MaxDelay:   3 * time.Second,
-    MaxJitter:  100 * time.Millisecond,
-    OnRetry: func(attempt int, err error, delay time.Duration) {
-        log.Printf("jev retry %d after %v: %v", attempt, delay, err)
-    },
-}))
-```
+`Instructions`, option descriptions, rubric levels, and `State` accept a Go
+string or any value that marshals to a JSON object or array (`jev.Content`).
 
 ## Configuration
 
-| Option | Default |
-| --- | --- |
-| `WithAPIKey(key)` | `$TYPESAFE_API_KEY` |
-| `WithModel(id)` | `jev-latest` (`jev.ModelJevLatest`; `jev.ModelJevPreview` is also published) |
-| `WithEndpoint(url)` | `https://api.typesafe.ai/v1/systemone` |
-| `WithHTTPClient(c)` | `&http.Client{Timeout: 30 * time.Second}` |
-| `WithRetryPolicy(p)` | `jev.DefaultRetryPolicy()` |
-| `WithMaxResponseBytes(n)` | 16 MiB |
+Options win over environment variables; blank environment values are ignored.
 
-The API key is never written to logs or errors. Whatever you put in `State`
-is sent verbatim to a third-party API; redact secrets before calling.
+| Option | Environment variable | Default |
+| --- | --- | --- |
+| `WithAPIKey(key)` | `TYPESAFE_API_KEY` | required |
+| `WithBaseURL(url)` | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` |
+| `WithModel(id)` | `TYPESAFE_DEFAULT_MODEL` | `jev-latest` |
+| `WithTimeout(d)` | | 10 s per attempt |
+| `WithHTTPClient(c)` | | `http.Client` with the timeout above |
+| `WithHeaders(map)` | | none |
+| `WithRetryPolicy(p)` | | `jev.DefaultRetryPolicy()` |
+| `WithMaxResponseBytes(n)` | | 16 MiB |
+| `WithLogger(*slog.Logger)` | | no logging |
+
+Per call, `Request` carries `Model`, `Headers`, `Extra` (additional top-level
+body fields for API features this SDK does not model yet), and `Retry`. Bound a
+whole call, including retries, with the context you pass to `Ask`.
+
+`client.ListModels(ctx)` returns the models and aliases available to the
+account. `client.AskRaw(ctx, req)` returns the undecoded 2xx body for callers
+who model the response themselves.
+
+## Errors
+
+- Requests are validated before sending; problems wrap `jev.ErrInvalidRequest`.
+- Every non-2xx status is a `*jev.APIError` with `StatusCode`, a `Message`
+  extracted from the JSON body (`error`, `message`, or `detail`, including
+  validation lists), `Endpoint`, `RequestID`, `RetryAfter`, and the raw `Body`.
+  It also matches a status-class sentinel through `errors.Is`:
+  `ErrBadRequest`, `ErrUnauthorized`, `ErrForbidden`, `ErrNotFound`,
+  `ErrUnprocessable`, `ErrRateLimited`, or `ErrServer` (5xx, including 529).
+- A request that gets no HTTP response is a `*jev.ConnectionError`, matching
+  `jev.ErrConnection`, and `jev.ErrTimeout` when the HTTP timeout elapsed.
+- A 2xx body is checked against the questions you sent. A missing answer, an
+  answer for a question you did not ask, a mismatched kind, an undeclared
+  label, an incomplete or non-normalised distribution, or an out-of-range
+  probability, score, or confidence wraps `jev.ErrResponseValidation`. The
+  client fails closed rather than handing you partial data.
+- Bodies above the cap wrap `jev.ErrResponseTooLarge`.
+
+## Retries
+
+`jev.DefaultRetryPolicy()` matches the official SDKs: two retries starting at
+500 ms with a 5 s cap and 25% jitter, on 408, 429, every 5xx, connection
+errors, and timeouts, honouring `Retry-After` and `retry-after-ms`, within a
+30 s total budget. Retrying stops as soon as your context is done. Start from
+the default and adjust:
+
+```go
+policy := jev.DefaultRetryPolicy()
+policy.MaxRetries = 4
+policy.Statuses = []int{429, 502, 503, 504}
+policy.OnRetry = func(attempt int, err error, delay time.Duration) {
+    log.Printf("jev retry %d in %v: %v", attempt, delay, err)
+}
+client, _ := jev.NewClient(jev.WithRetryPolicy(policy))
+```
+
+Pass `jev.RetryPolicy{}` to disable retries.
+
+## Privacy
+
+The API key is never written to logs or errors, and `WithLogger` records
+method, path, status, duration, and request id only, never headers or bodies.
+Whatever you put in `State` is sent verbatim to a third-party API; redact
+secrets before calling.
 
 ## API limits (as documented by TypeSafe)
 
 - Text only: a string, a JSON object, or a JSON array. No images or audio.
 - About 64k tokens per request, with state plus the longest single question
   within about 32k tokens.
-- A `Choice` supports up to 255 options. Input tokens are billed; output is
-  free.
+- Input tokens are billed; output is free.
 
-See the [TypeSafe docs](https://docs.typesafe.ai) and the
+See the [TypeSafe docs](https://docs.typesafe.ai), the
+[Python SDK](https://github.com/typesafe-ai/typesafe-sdk-python) this client
+mirrors, and the
 [System One launch post](https://typesafe.ai/blog/introducing-system-one-models-and-jev).
 
 ## Status
 
-This is a community client, not an official TypeSafe AI SDK. The response
+This is a community client, not an official TypeSafe AI SDK. Response
 validation is deliberately strict; if the live API's answer shape differs from
 the documented contract, please open an issue with the (redacted) response.
 

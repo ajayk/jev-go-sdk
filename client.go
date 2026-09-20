@@ -7,51 +7,77 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// DefaultEndpoint is TypeSafe AI's hosted System One endpoint.
-const DefaultEndpoint = "https://api.typesafe.ai/v1/systemone"
+// Environment variables read by [NewClient] when the matching option is
+// absent. Empty or whitespace-only values are ignored.
+const (
+	APIKeyEnv       = "TYPESAFE_API_KEY"
+	BaseURLEnv      = "TYPESAFE_BASE_URL"
+	DefaultModelEnv = "TYPESAFE_DEFAULT_MODEL"
+)
 
-// APIKeyEnv is the environment variable [NewClient] reads when no key is
-// supplied explicitly.
-const APIKeyEnv = "TYPESAFE_API_KEY"
+// DefaultBaseURL is TypeSafe AI's hosted API root.
+const DefaultBaseURL = "https://api.typesafe.ai"
+
+// API paths under the base URL.
+const (
+	SystemOnePath = "/v1/systemone"
+	ModelsPath    = "/v1/models"
+)
 
 // Model aliases published by TypeSafe AI. Exact versioned ids such as
-// "jev-1.13.0" are also accepted; the aliases are the stable surface.
+// "jev-1.13.0" are also accepted; [Client.ListModels] returns the current set.
 const (
-	// ModelJevLatest is the most recent stable, official Jev release.
+	// ModelJevLatest is the most recent stable, official Jev release, and the
+	// default model.
 	ModelJevLatest = "jev-latest"
 	// ModelJevPreview is the most recent Jev release, official or not.
 	ModelJevPreview = "jev-preview"
 )
 
-const (
-	defaultTimeout          = 30 * time.Second
-	defaultMaxResponseBytes = 16 << 20
-	userAgent               = "jev-go-sdk (+https://github.com/ajayk/jev-go-sdk)"
-)
+// DefaultTimeout is the HTTP timeout applied to each attempt when no HTTP
+// client or [WithTimeout] is supplied.
+const DefaultTimeout = 10 * time.Second
+
+const defaultMaxResponseBytes = 16 << 20
+
+// protectedHeaders cannot be overridden by WithHeaders or Request.Headers.
+var protectedHeaders = []string{"Authorization", "Accept", "User-Agent", "X-Typesafe-Sdk", "X-Typesafe-Runtime", "X-Typesafe-Retry-Count"}
 
 // Request is one System One call.
 type Request struct {
-	// Model is the model id or alias. Empty selects the client's model,
-	// which defaults to [ModelJevLatest].
-	Model string `json:"model"`
+	// Model is the model id or alias. Empty selects the client's default
+	// model.
+	Model string
 	// State is the content every question is evaluated against: a string,
 	// or a value that marshals to a JSON object or array.
-	State Content `json:"state"`
+	State Content
 	// Questions maps caller-chosen ids to questions. Answers come back under
 	// the same ids.
-	Questions map[string]Question `json:"questions"`
+	Questions map[string]Question
+	// Extra holds additional top-level body fields, shallow-merged over the
+	// body after model, state, and questions are set. A key that collides
+	// with one of those replaces it. Use it for API fields this SDK does not
+	// model yet.
+	Extra map[string]any
+	// Headers are additional request headers for this call. Protected
+	// headers (authentication, SDK identification, Accept) are not
+	// overridable.
+	Headers map[string]string
+	// Retry, if set, replaces the client's retry policy for this call.
+	Retry *RetryPolicy
 }
 
 // Validate reports whether r can be sent. Every failure wraps
@@ -78,7 +104,21 @@ func (r Request) Validate() error {
 			return fmt.Errorf("%w: question %q: %w", ErrInvalidRequest, id, err)
 		}
 	}
+	if r.Retry != nil {
+		if err := r.Retry.validate(); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		}
+	}
 	return nil
+}
+
+// body renders the wire body.
+func (r Request) body() ([]byte, error) {
+	fields := map[string]any{"model": r.Model, "state": r.State, "questions": r.Questions}
+	for k, v := range r.Extra {
+		fields[k] = v
+	}
+	return json.Marshal(fields)
 }
 
 // Response is the answer set for one Request.
@@ -90,22 +130,27 @@ type Response struct {
 	Answers map[string]Answer
 	// Usage is the token accounting for the call.
 	Usage Usage
+	// RequestID is the server's request id, or "" when absent.
+	RequestID string
 }
 
 // Noul returns the answer to the [Noul] question id, or ErrNoAnswer.
-func (r *Response) Noul(id string) (NoulAnswer, error) {
-	return typedAnswer[NoulAnswer](r, id)
-}
+func (r *Response) Noul(id string) (NoulAnswer, error) { return typedAnswer[NoulAnswer](r, id) }
 
 // Choice returns the answer to the [Choice] question id, or ErrNoAnswer.
-func (r *Response) Choice(id string) (ChoiceAnswer, error) {
-	return typedAnswer[ChoiceAnswer](r, id)
-}
+func (r *Response) Choice(id string) (ChoiceAnswer, error) { return typedAnswer[ChoiceAnswer](r, id) }
 
 // Score returns the answer to the [Score] question id, or ErrNoAnswer.
-func (r *Response) Score(id string) (ScoreAnswer, error) {
-	return typedAnswer[ScoreAnswer](r, id)
-}
+func (r *Response) Score(id string) (ScoreAnswer, error) { return typedAnswer[ScoreAnswer](r, id) }
+
+// Nouls returns every [NoulAnswer] keyed by question id.
+func (r *Response) Nouls() map[string]NoulAnswer { return answersOf[NoulAnswer](r) }
+
+// Choices returns every [ChoiceAnswer] keyed by question id.
+func (r *Response) Choices() map[string]ChoiceAnswer { return answersOf[ChoiceAnswer](r) }
+
+// Scores returns every [ScoreAnswer] keyed by question id.
+func (r *Response) Scores() map[string]ScoreAnswer { return answersOf[ScoreAnswer](r) }
 
 func typedAnswer[T Answer](r *Response, id string) (T, error) {
 	var zero T
@@ -117,6 +162,19 @@ func typedAnswer[T Answer](r *Response, id string) (T, error) {
 		return zero, fmt.Errorf("%w: question %q", ErrNoAnswer, id)
 	}
 	return a, nil
+}
+
+func answersOf[T Answer](r *Response) map[string]T {
+	out := make(map[string]T)
+	if r == nil {
+		return out
+	}
+	for id, a := range r.Answers {
+		if t, ok := a.(T); ok {
+			out[id] = t
+		}
+	}
+	return out
 }
 
 // Usage is the API's token accounting. Output tokens are reported but not
@@ -132,60 +190,38 @@ type wireResponse struct {
 	Usage   Usage                      `json:"usage"`
 }
 
-// RetryPolicy bounds the retries [Client.Ask] makes on transient failures.
-// Delay for attempt n is BaseDelay doubled n times, capped at MaxDelay, plus
-// up to MaxJitter; a Retry-After header longer than that replaces it.
-type RetryPolicy struct {
-	// MaxRetries is the number of additional attempts after the first. Zero
-	// disables retries.
-	MaxRetries int
-	BaseDelay  time.Duration
-	MaxDelay   time.Duration
-	MaxJitter  time.Duration
-	// OnRetry, if set, is called before each retry with the attempt number
-	// (starting at 1), the error being retried, and the delay to be slept.
-	OnRetry func(attempt int, err error, delay time.Duration)
+// ModelMetadata describes one model available to the account.
+type ModelMetadata struct {
+	// Name is the id or alias accepted by Request.Model.
+	Name string `json:"name"`
+	// Description is a human-readable summary of the model.
+	Description string `json:"description"`
+	// ReleaseDate is the release date, formatted YYYY-MM-DD.
+	ReleaseDate string `json:"release_date"`
 }
 
-// DefaultRetryPolicy suits the API's sub-second latency: two short backoffs.
-func DefaultRetryPolicy() RetryPolicy {
-	return RetryPolicy{MaxRetries: 2, BaseDelay: 500 * time.Millisecond, MaxDelay: 5 * time.Second, MaxJitter: 250 * time.Millisecond}
+// ModelList is the result of [Client.ListModels].
+type ModelList struct {
+	// Models holds the available models and aliases.
+	Models []ModelMetadata `json:"models"`
+	// RequestID is the server's request id, or "" when absent.
+	RequestID string `json:"-"`
 }
 
-func (p RetryPolicy) validate() error {
-	if p.MaxRetries < 0 || p.BaseDelay < 0 || p.MaxDelay < 0 || p.MaxJitter < 0 {
-		return errors.New("retry policy values must not be negative")
-	}
-	return nil
-}
-
-func (p RetryPolicy) delay(attempt int, retryAfter time.Duration) time.Duration {
-	d := p.BaseDelay
-	for range attempt {
-		if d >= p.MaxDelay/2 {
-			d = p.MaxDelay
-			break
-		}
-		d *= 2
-	}
-	d = min(d, p.MaxDelay)
-	if p.MaxJitter > 0 {
-		if n, err := rand.Int(rand.Reader, big.NewInt(int64(p.MaxJitter))); err == nil {
-			d += time.Duration(n.Int64())
-		}
-	}
-	return max(d, retryAfter)
-}
-
-// Client calls the System One API. Construct one with [NewClient]; a Client is
-// safe for concurrent use once constructed.
+// Client calls the TypeSafe AI API. Construct one with [NewClient]; a Client
+// is safe for concurrent use once constructed.
 type Client struct {
-	endpoint         string
+	baseURL          string
 	apiKey           string
 	model            string
 	httpClient       *http.Client
+	timeout          time.Duration
+	headers          map[string]string
 	retry            RetryPolicy
 	maxResponseBytes int64
+	logger           *slog.Logger
+	now              func() time.Time
+	sleep            func(context.Context, time.Duration) error
 }
 
 // Option configures a Client.
@@ -194,7 +230,7 @@ type Option func(*Client) error
 // WithAPIKey supplies the API key explicitly instead of reading [APIKeyEnv].
 func WithAPIKey(key string) Option {
 	return func(c *Client) error {
-		if key == "" {
+		if strings.TrimSpace(key) == "" {
 			return errors.New("api key must not be empty")
 		}
 		c.apiKey = key
@@ -202,11 +238,12 @@ func WithAPIKey(key string) Option {
 	}
 }
 
-// WithModel sets the model used by requests that leave Model empty. The
-// default is [ModelJevLatest].
+// WithModel sets the default model for requests that leave Model empty,
+// instead of reading [DefaultModelEnv]. The built-in default is
+// [ModelJevLatest].
 func WithModel(model string) Option {
 	return func(c *Client) error {
-		if model == "" {
+		if strings.TrimSpace(model) == "" {
 			return errors.New("model must not be empty")
 		}
 		c.model = model
@@ -214,24 +251,25 @@ func WithModel(model string) Option {
 	}
 }
 
-// WithEndpoint overrides the API endpoint. The URL must be absolute with an
-// http or https scheme.
-func WithEndpoint(endpoint string) Option {
+// WithBaseURL overrides the API root instead of reading [BaseURLEnv]. The URL
+// must be absolute with an http or https scheme; a trailing slash is
+// removed.
+func WithBaseURL(baseURL string) Option {
 	return func(c *Client) error {
-		u, err := url.Parse(endpoint)
+		u, err := url.Parse(baseURL)
 		if err != nil {
-			return fmt.Errorf("endpoint: %w", err)
+			return fmt.Errorf("base url: %w", err)
 		}
 		if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			return fmt.Errorf("endpoint %q must be an absolute http(s) URL", endpoint)
+			return fmt.Errorf("base url %q must be an absolute http(s) URL", baseURL)
 		}
-		c.endpoint = endpoint
+		c.baseURL = strings.TrimRight(baseURL, "/")
 		return nil
 	}
 }
 
 // WithHTTPClient supplies the HTTP client, including any timeout or
-// transport. The default has a 30-second timeout.
+// transport. Its Timeout is used as-is unless [WithTimeout] is also given.
 func WithHTTPClient(httpClient *http.Client) Option {
 	return func(c *Client) error {
 		if httpClient == nil {
@@ -242,7 +280,29 @@ func WithHTTPClient(httpClient *http.Client) Option {
 	}
 }
 
-// WithRetryPolicy overrides the retry policy.
+// WithTimeout sets the per-attempt HTTP timeout. The default is
+// [DefaultTimeout]. Use the context passed to Ask to bound a whole call.
+func WithTimeout(timeout time.Duration) Option {
+	return func(c *Client) error {
+		if timeout <= 0 {
+			return errors.New("timeout must be positive")
+		}
+		c.timeout = timeout
+		return nil
+	}
+}
+
+// WithHeaders adds default request headers to every call. Protected headers
+// (authentication, SDK identification, Accept) are not overridable.
+func WithHeaders(headers map[string]string) Option {
+	return func(c *Client) error {
+		c.headers = headers
+		return nil
+	}
+}
+
+// WithRetryPolicy overrides the retry policy. Pass RetryPolicy{} to disable
+// retries.
 func WithRetryPolicy(policy RetryPolicy) Option {
 	return func(c *Client) error {
 		if err := policy.validate(); err != nil {
@@ -254,6 +314,7 @@ func WithRetryPolicy(policy RetryPolicy) Option {
 }
 
 // WithMaxResponseBytes caps the response body the client is willing to read.
+// The default is 16 MiB.
 func WithMaxResponseBytes(limit int64) Option {
 	return func(c *Client) error {
 		if limit <= 0 {
@@ -264,15 +325,24 @@ func WithMaxResponseBytes(limit int64) Option {
 	}
 }
 
-// NewClient constructs a Client. The API key comes from [WithAPIKey] or, when
-// that option is absent, from the [APIKeyEnv] environment variable.
+// WithLogger logs each attempt at Info level (method, path, status,
+// duration, request id) and retries at Warn level. Headers and bodies are
+// never logged, so the API key and the state cannot leak through the log.
+func WithLogger(logger *slog.Logger) Option {
+	return func(c *Client) error {
+		c.logger = logger
+		return nil
+	}
+}
+
+// NewClient constructs a Client. Explicit options take precedence over the
+// environment variables; the API key is required from one or the other.
 func NewClient(opts ...Option) (*Client, error) {
 	c := &Client{
-		endpoint:         DefaultEndpoint,
-		model:            ModelJevLatest,
-		httpClient:       &http.Client{Timeout: defaultTimeout},
 		retry:            DefaultRetryPolicy(),
 		maxResponseBytes: defaultMaxResponseBytes,
+		now:              time.Now,
+		sleep:            sleepContext,
 	}
 	for _, opt := range opts {
 		if err := opt(c); err != nil {
@@ -280,87 +350,207 @@ func NewClient(opts ...Option) (*Client, error) {
 		}
 	}
 	if c.apiKey == "" {
-		c.apiKey = os.Getenv(APIKeyEnv)
+		c.apiKey = envValue(APIKeyEnv)
 	}
 	if c.apiKey == "" {
 		return nil, fmt.Errorf("api key is required: pass WithAPIKey or set %s", APIKeyEnv)
 	}
+	if c.baseURL == "" {
+		if fromEnv := envValue(BaseURLEnv); fromEnv != "" {
+			if err := WithBaseURL(fromEnv)(c); err != nil {
+				return nil, fmt.Errorf("%s: %w", BaseURLEnv, err)
+			}
+		} else {
+			c.baseURL = DefaultBaseURL
+		}
+	}
+	c.model = cmp.Or(c.model, envValue(DefaultModelEnv), ModelJevLatest)
+	switch {
+	case c.httpClient == nil:
+		c.httpClient = &http.Client{Timeout: cmp.Or(c.timeout, DefaultTimeout)}
+	case c.timeout != 0:
+		// Copy so the caller's client is not mutated.
+		clone := *c.httpClient
+		clone.Timeout = c.timeout
+		c.httpClient = &clone
+	}
 	return c, nil
 }
 
+func envValue(name string) string { return strings.TrimSpace(os.Getenv(name)) }
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // Ask sends req and returns its validated answers. Transient failures are
-// retried per the client's policy while ctx is live; the returned error is
-// the last attempt's. Every non-2xx status surfaces as an *APIError, and a
-// 2xx body that does not match the questions as sent surfaces as
-// ErrResponseValidation.
+// retried per the policy while ctx is live; the returned error is the last
+// attempt's. Every non-2xx status surfaces as an *APIError, a failure to get
+// a response as a *ConnectionError, and a 2xx body that does not match the
+// questions as sent as ErrResponseValidation.
 func (c *Client) Ask(ctx context.Context, req Request) (*Response, error) {
-	req.Model = cmp.Or(req.Model, c.model)
-	if err := req.Validate(); err != nil {
+	raw, requestID, err := c.AskRaw(ctx, req)
+	if err != nil {
 		return nil, err
 	}
-	body, err := json.Marshal(req)
+	resp, err := decodeResponse(raw, req.Questions)
 	if err != nil {
-		return nil, fmt.Errorf("%w: encoding: %w", ErrInvalidRequest, err)
+		return nil, err
 	}
+	resp.RequestID = requestID
+	return resp, nil
+}
 
-	for attempt := 0; ; attempt++ {
-		resp, err := c.do(ctx, body, req.Questions)
-		if err == nil {
-			return resp, nil
+// AskRaw sends req exactly as Ask does but returns the 2xx body undecoded,
+// together with the request id, for callers that model the response
+// themselves (for example to read fields this SDK does not know about).
+func (c *Client) AskRaw(ctx context.Context, req Request) (body []byte, requestID string, err error) {
+	req.Model = cmp.Or(req.Model, c.model)
+	if err := req.Validate(); err != nil {
+		return nil, "", err
+	}
+	payload, err := req.body()
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: encoding: %w", ErrInvalidRequest, err)
+	}
+	policy := c.retry
+	if req.Retry != nil {
+		policy = *req.Retry
+	}
+	return c.send(ctx, http.MethodPost, SystemOnePath, payload, req.Headers, policy)
+}
+
+// ListModels returns the models and aliases available to the account.
+func (c *Client) ListModels(ctx context.Context) (*ModelList, error) {
+	raw, requestID, err := c.send(ctx, http.MethodGet, ModelsPath, nil, nil, c.retry)
+	if err != nil {
+		return nil, err
+	}
+	var list ModelList
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, validationError("decoding model list: %w", err)
+	}
+	for i, m := range list.Models {
+		if m.Name == "" {
+			return nil, validationError("models[%d].name is missing", i)
 		}
-		if attempt >= c.retry.MaxRetries || ctx.Err() != nil || !IsRetryable(err) {
-			return nil, err
+	}
+	list.RequestID = requestID
+	return &list, nil
+}
+
+// send performs the retry loop around one request.
+func (c *Client) send(ctx context.Context, method, path string, payload []byte, headers map[string]string, policy RetryPolicy) ([]byte, string, error) {
+	endpoint := method + " " + path
+	started := c.now()
+	for attempt := 0; ; attempt++ {
+		body, requestID, err := c.do(ctx, method, path, payload, headers, attempt)
+		if err == nil {
+			return body, requestID, nil
+		}
+		if attempt >= policy.MaxRetries || ctx.Err() != nil || !policy.retryable(err) {
+			return nil, "", err
 		}
 		var retryAfter time.Duration
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
 			retryAfter = apiErr.RetryAfter
 		}
-		delay := c.retry.delay(attempt, retryAfter)
-		if c.retry.OnRetry != nil {
-			c.retry.OnRetry(attempt+1, err, delay)
+		delay := policy.delay(attempt+1, retryAfter)
+		if policy.Budget > 0 && c.now().Sub(started)+delay >= policy.Budget {
+			return nil, "", err
 		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, fmt.Errorf("jev: retry interrupted: %w (last error: %w)", ctx.Err(), err)
-		case <-timer.C:
+		if policy.OnRetry != nil {
+			policy.OnRetry(attempt+1, err, delay)
+		}
+		if c.logger != nil {
+			c.logger.WarnContext(ctx, "jev: retrying", "endpoint", endpoint, "attempt", attempt+1, "delay", delay, "error", err.Error())
+		}
+		if sleepErr := c.sleep(ctx, delay); sleepErr != nil {
+			return nil, "", fmt.Errorf("jev: retry interrupted: %w (last error: %w)", sleepErr, err)
 		}
 	}
 }
 
-func (c *Client) do(ctx context.Context, body []byte, questions map[string]Question) (*Response, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+// do performs one HTTP attempt and returns the 2xx body and request id.
+func (c *Client) do(ctx context.Context, method, path string, payload []byte, headers map[string]string, attempt int) ([]byte, string, error) {
+	endpoint := method + " " + path
+	var reader io.Reader
+	if payload != nil {
+		reader = bytes.NewReader(payload)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
-		return nil, fmt.Errorf("jev: building request: %w", err)
+		return nil, "", fmt.Errorf("jev: building request: %w", err)
+	}
+	for k, v := range c.headers {
+		httpReq.Header.Set(k, v)
+	}
+	for k, v := range headers {
+		httpReq.Header.Set(k, v)
+	}
+	for _, k := range protectedHeaders {
+		httpReq.Header.Del(k)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
-	httpReq.Header.Set("User-Agent", userAgent)
+	httpReq.Header.Set("User-Agent", sdkIdentity)
+	httpReq.Header.Set("X-Typesafe-Sdk", sdkIdentity)
+	httpReq.Header.Set("X-Typesafe-Runtime", runtimeIdentity)
+	if payload != nil {
+		httpReq.Header.Set("Content-Type", "application/json")
+	}
+	if attempt > 0 {
+		httpReq.Header.Set("X-Typesafe-Retry-Count", strconv.Itoa(attempt))
+	}
 
+	started := c.now()
 	httpResp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("jev: %w", err)
+		if isContextError(err) && ctx.Err() != nil {
+			return nil, "", fmt.Errorf("jev: %s: %w", endpoint, ctx.Err())
+		}
+		connErr := newConnectionError(endpoint, err)
+		if c.logger != nil {
+			c.logger.InfoContext(ctx, "jev: request failed", "endpoint", endpoint, "error", connErr.Error())
+		}
+		return nil, "", connErr
 	}
 	defer httpResp.Body.Close()
+	requestID := httpResp.Header.Get(RequestIDHeader)
+	if c.logger != nil {
+		c.logger.InfoContext(ctx, "jev: request", "endpoint", endpoint, "status", httpResp.StatusCode,
+			"duration", c.now().Sub(started), "request_id", requestID)
+	}
 
 	raw, err := io.ReadAll(io.LimitReader(httpResp.Body, c.maxResponseBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("jev: reading response: %w", err)
+		if isContextError(err) && ctx.Err() != nil {
+			return nil, "", fmt.Errorf("jev: %s: %w", endpoint, ctx.Err())
+		}
+		return nil, "", newConnectionError(endpoint, err)
 	}
 	if int64(len(raw)) > c.maxResponseBytes {
-		return nil, fmt.Errorf("%w: more than %d bytes", ErrResponseTooLarge, c.maxResponseBytes)
+		return nil, "", fmt.Errorf("%w: more than %d bytes", ErrResponseTooLarge, c.maxResponseBytes)
 	}
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
-		return nil, &APIError{
+		return nil, "", &APIError{
 			StatusCode: httpResp.StatusCode,
-			Body:       bodyExcerpt(raw),
-			RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After")),
+			Message:    extractMessage(raw),
+			Body:       raw,
+			Endpoint:   endpoint,
+			RequestID:  requestID,
+			RetryAfter: parseRetryAfter(httpResp.Header, c.now()),
 		}
 	}
-	return decodeResponse(raw, questions)
+	return raw, requestID, nil
 }
 
 // decodeResponse decodes a 2xx body and checks it against the questions as
