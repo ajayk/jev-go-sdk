@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -115,9 +116,7 @@ func (r Request) Validate() error {
 // body renders the wire body.
 func (r Request) body() ([]byte, error) {
 	fields := map[string]any{"model": r.Model, "state": r.State, "questions": r.Questions}
-	for k, v := range r.Extra {
-		fields[k] = v
-	}
+	maps.Copy(fields, r.Extra)
 	return json.Marshal(fields)
 }
 
@@ -228,14 +227,35 @@ type Client struct {
 type Option func(*Client) error
 
 // WithAPIKey supplies the API key explicitly instead of reading [APIKeyEnv].
+// Leading and trailing whitespace is stripped. An empty key, or one
+// containing whitespace, control characters, or non-ASCII characters, is
+// rejected; the key's value never appears in the error.
 func WithAPIKey(key string) Option {
 	return func(c *Client) error {
-		if strings.TrimSpace(key) == "" {
-			return errors.New("api key must not be empty")
+		key, err := validateAPIKey(key)
+		if err != nil {
+			return err
 		}
 		c.apiKey = key
 		return nil
 	}
+}
+
+// validateAPIKey strips surrounding whitespace and checks that what remains
+// is a non-empty run of printable ASCII without spaces, so an invalid key is
+// reported at construction rather than as a failed request. The returned
+// error never contains the key.
+func validateAPIKey(key string) (string, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", errors.New("api key must not be empty")
+	}
+	for i := 0; i < len(key); i++ {
+		if b := key[i]; b <= ' ' || b >= 0x7f {
+			return "", errors.New("api key must contain only printable ASCII characters without whitespace")
+		}
+	}
+	return key, nil
 }
 
 // WithModel sets the default model for requests that leave Model empty,
@@ -350,10 +370,15 @@ func NewClient(opts ...Option) (*Client, error) {
 		}
 	}
 	if c.apiKey == "" {
-		c.apiKey = envValue(APIKeyEnv)
-	}
-	if c.apiKey == "" {
-		return nil, fmt.Errorf("api key is required: pass WithAPIKey or set %s", APIKeyEnv)
+		fromEnv := envValue(APIKeyEnv)
+		if fromEnv == "" {
+			return nil, fmt.Errorf("api key is required: pass WithAPIKey or set %s", APIKeyEnv)
+		}
+		key, err := validateAPIKey(fromEnv)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", APIKeyEnv, err)
+		}
+		c.apiKey = key
 	}
 	if c.baseURL == "" {
 		if fromEnv := envValue(BaseURLEnv); fromEnv != "" {
@@ -449,9 +474,12 @@ func (c *Client) ListModels(ctx context.Context) (*ModelList, error) {
 // send performs the retry loop around one request.
 func (c *Client) send(ctx context.Context, method, path string, payload []byte, headers map[string]string, policy RetryPolicy) ([]byte, string, error) {
 	endpoint := method + " " + path
+	// Transports may echo header values into their errors; mask every
+	// credential we send before an error reaches logs or callers.
+	redact := newRedactor(c.apiKey, c.headers, headers)
 	started := c.now()
 	for attempt := 0; ; attempt++ {
-		body, requestID, err := c.do(ctx, method, path, payload, headers, attempt)
+		body, requestID, err := c.do(ctx, method, path, payload, headers, attempt, redact)
 		if err == nil {
 			return body, requestID, nil
 		}
@@ -459,8 +487,7 @@ func (c *Client) send(ctx context.Context, method, path string, payload []byte, 
 			return nil, "", err
 		}
 		var retryAfter time.Duration
-		var apiErr *APIError
-		if errors.As(err, &apiErr) {
+		if apiErr, ok := errors.AsType[*APIError](err); ok {
 			retryAfter = apiErr.RetryAfter
 		}
 		delay := policy.delay(attempt+1, retryAfter)
@@ -480,7 +507,8 @@ func (c *Client) send(ctx context.Context, method, path string, payload []byte, 
 }
 
 // do performs one HTTP attempt and returns the 2xx body and request id.
-func (c *Client) do(ctx context.Context, method, path string, payload []byte, headers map[string]string, attempt int) ([]byte, string, error) {
+// Transport errors pass through redact before they are returned or logged.
+func (c *Client) do(ctx context.Context, method, path string, payload []byte, headers map[string]string, attempt int, redact redactor) ([]byte, string, error) {
 	endpoint := method + " " + path
 	var reader io.Reader
 	if payload != nil {
@@ -517,7 +545,7 @@ func (c *Client) do(ctx context.Context, method, path string, payload []byte, he
 		if isContextError(err) && ctx.Err() != nil {
 			return nil, "", fmt.Errorf("jev: %s: %w", endpoint, ctx.Err())
 		}
-		connErr := newConnectionError(endpoint, err)
+		connErr := newConnectionError(endpoint, err, redact)
 		if c.logger != nil {
 			c.logger.InfoContext(ctx, "jev: request failed", "endpoint", endpoint, "error", connErr.Error())
 		}
@@ -535,7 +563,7 @@ func (c *Client) do(ctx context.Context, method, path string, payload []byte, he
 		if isContextError(err) && ctx.Err() != nil {
 			return nil, "", fmt.Errorf("jev: %s: %w", endpoint, ctx.Err())
 		}
-		return nil, "", newConnectionError(endpoint, err)
+		return nil, "", newConnectionError(endpoint, err, redact)
 	}
 	if int64(len(raw)) > c.maxResponseBytes {
 		return nil, "", fmt.Errorf("%w: more than %d bytes", ErrResponseTooLarge, c.maxResponseBytes)

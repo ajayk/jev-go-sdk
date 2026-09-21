@@ -9,7 +9,7 @@ import (
 
 // Version is the SDK version reported in the User-Agent and X-TypeSafe-SDK
 // headers.
-const Version = "0.2.0"
+const Version = "0.2.1"
 
 const sdkName = "jev-go-sdk"
 

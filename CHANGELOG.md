@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.1 (2026-09-21)
+
+Tracks the official Python SDK v0.7.1.
+
+### Bug fixes
+
+- The API key is validated when the client is built, not when the first request fails. Leading and trailing whitespace is stripped from `WithAPIKey` and `TYPESAFE_API_KEY`; an empty key, or one containing whitespace, control characters, or non-ASCII characters, is rejected. An invalid explicit key does not fall back to the environment, and the error never contains the key.
+- Credentials are masked in `*ConnectionError`. Transports (including custom `http.RoundTripper`s and proxies) can echo header values into their errors; the API key and the values of credential-bearing headers (`Authorization`, `Proxy-Authorization`, `X-API-Key`, `Api-Key`, `Cookie`, and any name containing `token` or `secret`) are replaced by `***` in the error, in whatever `WithLogger` and `OnRetry` see, and in the unwrapped chain. Errors free of credentials are untouched, so `errors.Is`/`errors.As` on the transport error keep working.
+- Locally rejected requests (for example a header value containing a newline) surface as `*ConnectionError` and are retried like other connection errors, matching the official SDKs.
+
+### Documentation
+
+- Examples for using the client through AI gateways (OpenRouter, Vercel AI Gateway).
+
 ## v0.2.0 (2026-09-19)
 
 Aligns the client with the official TypeSafe SDKs' feature surface.
