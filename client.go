@@ -551,7 +551,7 @@ func (c *Client) do(ctx context.Context, method, path string, payload []byte, he
 		}
 		return nil, "", connErr
 	}
-	defer func() { _ = httpResp.Body.Close() }()
+	defer httpResp.Body.Close()
 	requestID := httpResp.Header.Get(RequestIDHeader)
 	if c.logger != nil {
 		c.logger.InfoContext(ctx, "jev: request", "endpoint", endpoint, "status", httpResp.StatusCode,
