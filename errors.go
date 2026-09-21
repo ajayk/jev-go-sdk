@@ -153,19 +153,19 @@ func (e *ConnectionError) Is(target error) bool {
 // newConnectionError classifies a transport error from http.Client.Do.
 // net/http reports its own timeouts as errors that also match
 // context.DeadlineExceeded, so the Timeout method decides; the caller
-// separately checks whether its own context expired.
-func newConnectionError(endpoint string, err error) *ConnectionError {
+// separately checks whether its own context expired. If the transport echoed
+// a credential into its message, Err is replaced by a flat error carrying
+// only the masked text; otherwise it is kept as-is for errors.Is/As.
+func newConnectionError(endpoint string, err error, redact redactor) *ConnectionError {
 	timeout := false
-	var netErr net.Error
-	if errors.As(err, &netErr) {
+	if netErr, ok := errors.AsType[net.Error](err); ok {
 		timeout = netErr.Timeout()
 	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		timeout = urlErr.Timeout()
 		err = urlErr.Err
 	}
-	return &ConnectionError{Endpoint: endpoint, Timeout: timeout, Err: err}
+	return &ConnectionError{Endpoint: endpoint, Timeout: timeout, Err: redact.redactError(err)}
 }
 
 const messageExcerptLimit = 200

@@ -29,7 +29,8 @@
 //
 // Configuration follows the official SDKs: the API key, base URL, and default
 // model come from options or from the TYPESAFE_API_KEY, TYPESAFE_BASE_URL, and
-// TYPESAFE_DEFAULT_MODEL environment variables. The client never logs the API
-// key or request bodies. What you send is forwarded verbatim to a third-party
-// API; redact before you call.
+// TYPESAFE_DEFAULT_MODEL environment variables. The API key is validated when
+// the client is built. The client never logs the API key or request bodies,
+// and masks credentials that a transport echoes into a connection error. What
+// you send is forwarded verbatim to a third-party API; redact before you call.
 package jev

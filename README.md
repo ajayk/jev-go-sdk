@@ -74,7 +74,7 @@ Options win over environment variables; blank environment values are ignored.
 
 | Option | Environment variable | Default |
 | --- | --- | --- |
-| `WithAPIKey(key)` | `TYPESAFE_API_KEY` | required |
+| `WithAPIKey(key)` | `TYPESAFE_API_KEY` | required; surrounding whitespace is stripped, and the key must be printable ASCII without spaces |
 | `WithBaseURL(url)` | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` |
 | `WithModel(id)` | `TYPESAFE_DEFAULT_MODEL` | `jev-latest` |
 | `WithTimeout(d)` | | 10 s per attempt |
@@ -91,6 +91,32 @@ whole call, including retries, with the context you pass to `Ask`.
 `client.ListModels(ctx)` returns the models and aliases available to the
 account. `client.AskRaw(ctx, req)` returns the undecoded 2xx body for callers
 who model the response themselves.
+
+## AI gateways
+
+Point `WithBaseURL` (or `TYPESAFE_BASE_URL`) at any service that implements
+the TypeSafe OpenAPI specification; the client appends `/v1/systemone` and
+`/v1/models` to it. Use the gateway's own key and model id.
+
+```go
+// OpenRouter
+client, err := jev.NewClient(
+    jev.WithAPIKey(os.Getenv("OPENROUTER_API_KEY")),
+    jev.WithBaseURL("https://openrouter.ai/api"),
+    jev.WithModel("~typesafe/jev-latest"),
+)
+
+// Vercel AI Gateway
+client, err := jev.NewClient(
+    jev.WithAPIKey(os.Getenv("AI_GATEWAY_API_KEY")),
+    jev.WithBaseURL("https://ai-gateway.vercel.sh/typesafe"),
+    jev.WithModel("typesafe-ai/jev"),
+)
+```
+
+Gateway-specific headers go in `WithHeaders` (for every call) or
+`Request.Headers` (per call). Header values whose names look like credentials
+are masked if a transport echoes them into an error; see Privacy.
 
 ## Errors
 
@@ -132,10 +158,16 @@ Pass `jev.RetryPolicy{}` to disable retries.
 
 ## Privacy
 
-The API key is never written to logs or errors, and `WithLogger` records
-method, path, status, duration, and request id only, never headers or bodies.
-Whatever you put in `State` is sent verbatim to a third-party API; redact
-secrets before calling.
+The API key is validated when the client is built and never written to logs
+or errors; the construction error for a malformed key does not contain the
+key. `WithLogger` records method, path, status, duration, and request id only,
+never headers or bodies. Transports and proxies can quote header values in
+their errors, so a `*ConnectionError` masks the API key and the values of
+credential-bearing headers (`Authorization`, `Proxy-Authorization`,
+`X-API-Key`, `Api-Key`, `Cookie`, and any name containing `token` or `secret`)
+as `***`, including in the unwrapped chain and in what `OnRetry` and the
+logger see. Whatever you put in `State` is sent verbatim to a third-party API;
+redact secrets before calling.
 
 ## API limits (as documented by TypeSafe)
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 
 	"github.com/ajayk/jev-go-sdk"
 )
@@ -143,4 +144,25 @@ func ExampleClient_ListModels() {
 	}
 	// Output:
 	// jev-latest released 2026-09-15: General-purpose system one model.
+}
+
+// Route through an AI gateway that implements the TypeSafe OpenAPI
+// specification by pointing the client at the gateway's root and using the
+// gateway's own key and model id. The client appends /v1/systemone itself.
+func ExampleWithBaseURL() {
+	// OpenRouter
+	openRouter, err := jev.NewClient(
+		jev.WithAPIKey(os.Getenv("OPENROUTER_API_KEY")),
+		jev.WithBaseURL("https://openrouter.ai/api"),
+		jev.WithModel("~typesafe/jev-latest"),
+	)
+	_, _ = openRouter, err
+
+	// Vercel AI Gateway
+	vercel, err := jev.NewClient(
+		jev.WithAPIKey(os.Getenv("AI_GATEWAY_API_KEY")),
+		jev.WithBaseURL("https://ai-gateway.vercel.sh/typesafe"),
+		jev.WithModel("typesafe-ai/jev"),
+	)
+	_, _ = vercel, err
 }
