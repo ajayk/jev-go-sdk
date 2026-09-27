@@ -290,6 +290,9 @@ func WithBaseURL(baseURL string) Option {
 
 // WithHTTPClient supplies the HTTP client, including any timeout or
 // transport. Its Timeout is used as-is unless [WithTimeout] is also given.
+// The default client negotiates HTTP/2 over TLS; a custom transport keeps
+// that only if it is cloned from [http.DefaultTransport] or sets
+// ForceAttemptHTTP2.
 func WithHTTPClient(httpClient *http.Client) Option {
 	return func(c *Client) error {
 		if httpClient == nil {
