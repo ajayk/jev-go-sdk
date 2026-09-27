@@ -92,6 +92,26 @@ whole call, including retries, with the context you pass to `Ask`.
 account. `client.AskRaw(ctx, req)` returns the undecoded 2xx body for callers
 who model the response themselves.
 
+## HTTP/2
+
+HTTP/2 multiplexes many concurrent requests over one connection, which helps
+when you fan out calls from several goroutines. Unlike the Python SDK, no extra
+dependency is needed: the default client uses `http.DefaultTransport`, which
+negotiates HTTP/2 over TLS automatically. If you supply your own transport,
+keep HTTP/2 enabled:
+
+```go
+transport := http.DefaultTransport.(*http.Transport).Clone()
+transport.MaxIdleConnsPerHost = 32 // your tuning here
+client, err := jev.NewClient(
+    jev.WithHTTPClient(&http.Client{Transport: transport, Timeout: jev.DefaultTimeout}),
+)
+```
+
+A hand-built `&http.Transport{...}` with a custom `TLSClientConfig` or
+`DialTLSContext` does not attempt HTTP/2 unless you set `ForceAttemptHTTP2`
+(or `Protocols`).
+
 ## AI gateways
 
 Point `WithBaseURL` (or `TYPESAFE_BASE_URL`) at any service that implements

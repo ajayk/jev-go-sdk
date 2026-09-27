@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.2 (2026-09-27)
+
+Tracks the official Python SDK v0.7.2.
+
+The Python release adds an optional `http2` extra. Go needs no equivalent: the
+default client already negotiates HTTP/2 over TLS through `http.DefaultTransport`.
+
+### Documentation
+
+- Document HTTP/2 use, including how to keep it enabled with a custom transport passed to `WithHTTPClient`.
+
+### Tests
+
+- Cover requests over HTTP/2 and guard that the default client keeps `http.DefaultTransport`.
+
 ## v0.2.1 (2026-09-21)
 
 Tracks the official Python SDK v0.7.1.

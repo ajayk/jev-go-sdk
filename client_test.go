@@ -637,3 +637,37 @@ func TestNewClientOptions(t *testing.T) {
 		t.Errorf("WithTimeout mutated the caller's http.Client: %v", shared.Timeout)
 	}
 }
+
+func TestAskOverHTTP2(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 {
+			http.Error(w, "want HTTP/2, got "+r.Proto, http.StatusHTTPVersionNotSupported)
+			return
+		}
+		_, _ = w.Write([]byte(sampleBody(sampleAnswers)))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	client, err := NewClient(WithAPIKey("k"), WithBaseURL(srv.URL), WithHTTPClient(srv.Client()), WithHeaders(map[string]string{"X-Gateway": "g"}), WithRetryPolicy(fastRetry(0)))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := client.Ask(t.Context(), sampleRequest()); err != nil {
+		t.Fatalf("Ask over HTTP/2: %v", err)
+	}
+}
+
+func TestDefaultHTTPClientNegotiatesHTTP2(t *testing.T) {
+	t.Parallel()
+	client, err := NewClient(WithAPIKey("k"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	// A nil Transport means http.DefaultTransport, which negotiates HTTP/2
+	// over TLS. A custom transport here would silently fall back to HTTP/1.1.
+	if client.httpClient.Transport != nil {
+		t.Errorf("default http.Client transport: got = %T, want nil (http.DefaultTransport)", client.httpClient.Transport)
+	}
+}
