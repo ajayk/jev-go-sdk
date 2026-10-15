@@ -105,6 +105,29 @@ func ExampleRaw() {
 	// spam p=0.02
 }
 
+// Images are placed directly in content, listed in Request.Assets under an
+// alias, or referenced in text while attached. A Box question locates
+// something in the image.
+func ExampleImage() {
+	srv := fakeAPI(`{"model":"jev-preview","answers":{"dog":{"type":"box","box":{"top":0.2,"bottom":0.66,"left":0.19,"right":0.68},"confidence":0.9}},"usage":{"input_tokens":9,"output_tokens":1}}`)
+	defer srv.Close()
+	client, _ := jev.NewClient(jev.WithAPIKey("sk-example"), jev.WithBaseURL(srv.URL), jev.WithHTTPClient(srv.Client()))
+
+	photo := jev.NewImage([]byte("\x89PNG\r\n\x1a\n...")) // or jev.ImageFromFile("photo.png")
+	resp, err := client.Ask(context.Background(), jev.Request{
+		Model:     jev.ModelJevPreview,
+		State:     photo,
+		Questions: map[string]jev.Question{"dog": jev.Box{Instructions: "The dog"}},
+	})
+	if err != nil {
+		panic(err)
+	}
+	dog, _ := resp.Box("dog")
+	fmt.Printf("dog top=%.2f bottom=%.2f left=%.2f right=%.2f\n", dog.Box.Top, dog.Box.Bottom, dog.Box.Left, dog.Box.Right)
+	// Output:
+	// dog top=0.20 bottom=0.66 left=0.19 right=0.68
+}
+
 // Non-2xx responses are *APIError values that also match a status-class
 // sentinel, so callers can branch with errors.Is.
 func ExampleAPIError() {

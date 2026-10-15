@@ -10,11 +10,11 @@ import (
 	"strconv"
 )
 
-// Answer is one typed answer: a [NoulAnswer], [ChoiceAnswer], or
-// [ScoreAnswer]. Switch on the concrete type, or use the typed getters on
+// Answer is one typed answer: a [NoulAnswer], [ChoiceAnswer], [ScoreAnswer],
+// or [BoxAnswer]. Switch on the concrete type, or use the typed getters on
 // [Response].
 type Answer interface {
-	// Kind returns the wire kind: "noul", "choice", or "score".
+	// Kind returns the wire kind: "noul", "choice", "score", or "box".
 	Kind() string
 	answer()
 }
@@ -91,6 +91,38 @@ func (a ScoreAnswer) Level() (int, float64) {
 	return best, bestP
 }
 
+// BoxAnswer answers a [Box] question.
+type BoxAnswer struct {
+	// Box is the located box.
+	Box BoxCoordinates
+	// Confidence is the model's confidence in the box, in [0, 1], or nil
+	// when the model does not provide one.
+	Confidence *float64
+}
+
+var _ Answer = (*BoxAnswer)(nil)
+
+// Kind returns "box".
+func (BoxAnswer) Kind() string { return KindBox }
+func (BoxAnswer) answer()      {}
+
+// BoxCoordinates are a box's edges as fractions, in [0, 1], of the image's
+// height (Top, Bottom, measured from the top) and width (Left, Right,
+// measured from the left). Each is the expected position of its edge.
+type BoxCoordinates struct {
+	Top    float64
+	Bottom float64
+	Left   float64
+	Right  float64
+}
+
+type wireBox struct {
+	Top    *float64 `json:"top"`
+	Bottom *float64 `json:"bottom"`
+	Left   *float64 `json:"left"`
+	Right  *float64 `json:"right"`
+}
+
 type wireAnswer struct {
 	Type          string             `json:"type"`
 	Noul          *float64           `json:"noul"`
@@ -99,6 +131,7 @@ type wireAnswer struct {
 	Legend        map[string]Content `json:"legend"`
 	Probabilities map[string]float64 `json:"probabilities"`
 	Confidence    *float64           `json:"confidence"`
+	Box           *wireBox           `json:"box"`
 }
 
 // decodeAnswer decodes one answer and checks it against the question that
@@ -159,6 +192,25 @@ func decodeAnswer(id string, raw json.RawMessage, question Question) (Answer, er
 			return nil, validationError("answer %q: %w", id, err)
 		}
 		return ScoreAnswer{Score: *w.Score, Legend: w.Legend, Probabilities: w.Probabilities, Confidence: *w.Confidence}, nil
+	case Box:
+		if w.Box == nil {
+			return nil, validationError("answer %q: box is missing", id)
+		}
+		for _, edge := range []struct {
+			name  string
+			value *float64
+		}{{"box.top", w.Box.Top}, {"box.bottom", w.Box.Bottom}, {"box.left", w.Box.Left}, {"box.right", w.Box.Right}} {
+			if err := checkUnitInterval(edge.name, edge.value); err != nil {
+				return nil, validationError("answer %q: %w", id, err)
+			}
+		}
+		if w.Confidence != nil {
+			if err := checkUnitInterval("confidence", w.Confidence); err != nil {
+				return nil, validationError("answer %q: %w", id, err)
+			}
+		}
+		box := BoxCoordinates{Top: *w.Box.Top, Bottom: *w.Box.Bottom, Left: *w.Box.Left, Right: *w.Box.Right}
+		return BoxAnswer{Box: box, Confidence: w.Confidence}, nil
 	default:
 		return nil, validationError("answer %q: unsupported question type %T", id, question)
 	}

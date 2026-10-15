@@ -12,10 +12,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -54,8 +54,22 @@ const DefaultTimeout = 10 * time.Second
 
 const defaultMaxResponseBytes = 16 << 20
 
+// minCompressedBodyBytes is the smallest body [WithCompression] compresses.
+// Smaller bodies fit in a single TCP segment, so compressing them saves no
+// round trips and only costs CPU.
+const minCompressedBodyBytes = 1024
+
+// Connection pool settings of the default HTTP client. http.DefaultTransport
+// keeps only two idle connections per host, so bursts beyond that reopen
+// connections with new TLS handshakes. Keep every pooled connection; the API
+// reuses idle connections for far longer than 30 seconds.
+const (
+	defaultMaxIdleConns    = 100
+	defaultIdleConnTimeout = 30 * time.Second
+)
+
 // protectedHeaders cannot be overridden by WithHeaders or Request.Headers.
-var protectedHeaders = []string{"Authorization", "Accept", "User-Agent", "X-Typesafe-Sdk", "X-Typesafe-Runtime", "X-Typesafe-Retry-Count"}
+var protectedHeaders = []string{"Authorization", "Accept", "Content-Encoding", "User-Agent", "X-Typesafe-Sdk", "X-Typesafe-Runtime", "X-Typesafe-Retry-Count"}
 
 // Request is one System One call.
 type Request struct {
@@ -63,15 +77,22 @@ type Request struct {
 	// model.
 	Model string
 	// State is the content every question is evaluated against: a string,
-	// or a value that marshals to a JSON object or array.
+	// an [*Image], or a value that marshals to a JSON object or array.
 	State Content
 	// Questions maps caller-chosen ids to questions. Answers come back under
 	// the same ids.
 	Questions map[string]Question
+	// Assets maps aliases to images. Each alias, wherever it appears as or
+	// inside a string in the state, instructions, or criteria, stands for its
+	// image; an image listed here and also placed in content is sent once,
+	// under its alias. Pick aliases that cannot occur by accident, such as
+	// "<photo>". See [Image] for the other ways to send images.
+	Assets map[string]*Image
 	// Extra holds additional top-level body fields, shallow-merged over the
-	// body after model, state, and questions are set. A key that collides
-	// with one of those replaces it. Use it for API fields this SDK does not
-	// model yet.
+	// body after model, state, questions, and assets are set. A key that
+	// collides with one of those replaces it; an "assets" key also stops the
+	// SDK from sending any images itself. Use it for API fields this SDK does
+	// not model yet.
 	Extra map[string]any
 	// Headers are additional request headers for this call. Protected
 	// headers (authentication, SDK identification, Accept) are not
@@ -105,6 +126,14 @@ func (r Request) Validate() error {
 			return fmt.Errorf("%w: question %q: %w", ErrInvalidRequest, id, err)
 		}
 	}
+	for alias, img := range r.Assets {
+		if strings.TrimSpace(alias) == "" {
+			return fmt.Errorf("%w: asset aliases must not be empty", ErrInvalidRequest)
+		}
+		if img == nil {
+			return fmt.Errorf("%w: asset %q is a nil *Image", ErrInvalidRequest, alias)
+		}
+	}
 	if r.Retry != nil {
 		if err := r.Retry.validate(); err != nil {
 			return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
@@ -113,11 +142,20 @@ func (r Request) Validate() error {
 	return nil
 }
 
-// body renders the wire body.
+// body renders the JSON wire body, without assets. HTML escaping is off so
+// image references in the state and extra fields stay readable on the wire.
 func (r Request) body() ([]byte, error) {
-	fields := map[string]any{"model": r.Model, "state": r.State, "questions": r.Questions}
-	maps.Copy(fields, r.Extra)
-	return json.Marshal(fields)
+	fields := map[string]any{"model": r.Model, "state": stringifyNonFinite(r.State), "questions": r.Questions}
+	for k, v := range r.Extra {
+		fields[k] = stringifyNonFinite(v)
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(fields); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 // Response is the answer set for one Request.
@@ -142,6 +180,9 @@ func (r *Response) Choice(id string) (ChoiceAnswer, error) { return typedAnswer[
 // Score returns the answer to the [Score] question id, or ErrNoAnswer.
 func (r *Response) Score(id string) (ScoreAnswer, error) { return typedAnswer[ScoreAnswer](r, id) }
 
+// Box returns the answer to the [Box] question id, or ErrNoAnswer.
+func (r *Response) Box(id string) (BoxAnswer, error) { return typedAnswer[BoxAnswer](r, id) }
+
 // Nouls returns every [NoulAnswer] keyed by question id.
 func (r *Response) Nouls() map[string]NoulAnswer { return answersOf[NoulAnswer](r) }
 
@@ -150,6 +191,9 @@ func (r *Response) Choices() map[string]ChoiceAnswer { return answersOf[ChoiceAn
 
 // Scores returns every [ScoreAnswer] keyed by question id.
 func (r *Response) Scores() map[string]ScoreAnswer { return answersOf[ScoreAnswer](r) }
+
+// Boxes returns every [BoxAnswer] keyed by question id.
+func (r *Response) Boxes() map[string]BoxAnswer { return answersOf[BoxAnswer](r) }
 
 func typedAnswer[T Answer](r *Response, id string) (T, error) {
 	var zero T
@@ -219,6 +263,9 @@ type Client struct {
 	retry            RetryPolicy
 	maxResponseBytes int64
 	logger           *slog.Logger
+	encoding         string
+	compress         func([]byte) ([]byte, error)
+	attached         attachedAssets
 	now              func() time.Time
 	sleep            func(context.Context, time.Duration) error
 }
@@ -290,9 +337,11 @@ func WithBaseURL(baseURL string) Option {
 
 // WithHTTPClient supplies the HTTP client, including any timeout or
 // transport. Its Timeout is used as-is unless [WithTimeout] is also given.
-// The default client negotiates HTTP/2 over TLS; a custom transport keeps
-// that only if it is cloned from [http.DefaultTransport] or sets
-// ForceAttemptHTTP2.
+// The default client's transport is cloned from [http.DefaultTransport],
+// negotiates HTTP/2 over TLS, and keeps up to 100 idle connections per host
+// for 30 seconds. A custom transport keeps HTTP/2 only if it is cloned from
+// [http.DefaultTransport] or sets ForceAttemptHTTP2, and should raise
+// MaxIdleConnsPerHost for concurrent use.
 func WithHTTPClient(httpClient *http.Client) Option {
 	return func(c *Client) error {
 		if httpClient == nil {
@@ -358,6 +407,33 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+// WithCompression compresses request bodies of 1 KiB or more with compress
+// and labels them with the Content-Encoding encoding. Bodies are sent
+// uncompressed by default because the Go standard library has no zstd, the
+// encoding the official SDKs use by default and the API accepts. Plug in an
+// implementation such as github.com/klauspost/compress/zstd:
+//
+//	encoder, _ := zstd.NewWriter(nil)
+//	client, err := jev.NewClient(jev.WithCompression("zstd", func(body []byte) ([]byte, error) {
+//		return encoder.EncodeAll(body, nil), nil
+//	}))
+//
+// compress must be safe for concurrent use. A body is compressed once per
+// call and reused by every retry. APIs other than TypeSafe's, such as some
+// gateways, may not accept compressed bodies.
+func WithCompression(encoding string, compress func([]byte) ([]byte, error)) Option {
+	return func(c *Client) error {
+		if strings.TrimSpace(encoding) == "" || strings.ContainsAny(encoding, " \t\r\n,") {
+			return fmt.Errorf("compression encoding %q must be a single content-coding token", encoding)
+		}
+		if compress == nil {
+			return errors.New("compression function must not be nil")
+		}
+		c.encoding, c.compress = encoding, compress
+		return nil
+	}
+}
+
 // NewClient constructs a Client. Explicit options take precedence over the
 // environment variables; the API key is required from one or the other.
 func NewClient(opts ...Option) (*Client, error) {
@@ -395,7 +471,7 @@ func NewClient(opts ...Option) (*Client, error) {
 	c.model = cmp.Or(c.model, envValue(DefaultModelEnv), ModelJevLatest)
 	switch {
 	case c.httpClient == nil:
-		c.httpClient = &http.Client{Timeout: cmp.Or(c.timeout, DefaultTimeout)}
+		c.httpClient = &http.Client{Timeout: cmp.Or(c.timeout, DefaultTimeout), Transport: defaultTransport()}
 	case c.timeout != 0:
 		// Copy so the caller's client is not mutated.
 		clone := *c.httpClient
@@ -403,6 +479,34 @@ func NewClient(opts ...Option) (*Client, error) {
 		c.httpClient = &clone
 	}
 	return c, nil
+}
+
+// defaultTransport clones http.DefaultTransport with a pool sized for
+// concurrent calls. It returns nil, meaning http.DefaultTransport itself,
+// when that has been replaced by something other than an *http.Transport.
+func defaultTransport() http.RoundTripper {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil
+	}
+	t := base.Clone()
+	t.MaxIdleConns = defaultMaxIdleConns
+	t.MaxIdleConnsPerHost = defaultMaxIdleConns
+	t.IdleConnTimeout = defaultIdleConnTimeout
+	return t
+}
+
+// AttachAssets attaches images to calls made on c until detach is called, so
+// text can reference them through their String form, such as
+// fmt.Sprintf("Product: %s", photo). A call sends each attached image whose
+// reference appears in its request. Attachments may overlap; an image stays
+// attached until every attachment holding it is detached. Nil images are
+// ignored, and calling detach more than once has no further effect.
+//
+//	detach := client.AttachAssets(photo)
+//	defer detach()
+func (c *Client) AttachAssets(images ...*Image) (detach func()) {
+	return c.attached.attach(images)
 }
 
 func envValue(name string) string { return strings.TrimSpace(os.Getenv(name)) }
@@ -444,15 +548,58 @@ func (c *Client) AskRaw(ctx context.Context, req Request) (body []byte, requestI
 	if err := req.Validate(); err != nil {
 		return nil, "", err
 	}
-	payload, err := req.body()
+	payload, err := c.systemOnePayload(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: encoding: %w", ErrInvalidRequest, err)
+		return nil, "", err
 	}
 	policy := c.retry
 	if req.Retry != nil {
 		policy = *req.Retry
 	}
 	return c.send(ctx, http.MethodPost, SystemOnePath, payload, req.Headers, policy)
+}
+
+// payload is an encoded request body.
+type payload struct {
+	body        []byte
+	contentType string
+	encoding    string
+}
+
+// systemOnePayload encodes req as JSON or, when it sends images, as
+// multipart/form-data, then compresses it if configured.
+func (c *Client) systemOnePayload(req Request) (*payload, error) {
+	body, err := req.body()
+	if err != nil {
+		return nil, fmt.Errorf("%w: encoding: %w", ErrInvalidRequest, err)
+	}
+	p := &payload{body: body, contentType: "application/json"}
+	if _, ok := req.Extra["assets"]; !ok {
+		var images []namedImage
+		body, images = placeAssets(body, req.Assets, c.attached.snapshot())
+		// The images placed in req are found by reference while encoding, so
+		// keep req reachable until then.
+		runtime.KeepAlive(req)
+		if len(images) > 0 {
+			resolved := make([]*resolvedImage, len(images))
+			for i, n := range images {
+				if resolved[i], err = n.image.resolve(); err != nil {
+					return nil, fmt.Errorf("%w: asset %q: %w", ErrInvalidRequest, n.name, err)
+				}
+			}
+			if p.contentType, p.body, err = encodeMultipart(withAssets(body, images), resolved); err != nil {
+				return nil, fmt.Errorf("%w: encoding assets: %w", ErrInvalidRequest, err)
+			}
+		}
+	}
+	if c.compress != nil && len(p.body) >= minCompressedBodyBytes {
+		compressed, err := c.compress(p.body)
+		if err != nil {
+			return nil, fmt.Errorf("jev: compressing request body: %w", err)
+		}
+		p.body, p.encoding = compressed, c.encoding
+	}
+	return p, nil
 }
 
 // ListModels returns the models and aliases available to the account.
@@ -475,7 +622,7 @@ func (c *Client) ListModels(ctx context.Context) (*ModelList, error) {
 }
 
 // send performs the retry loop around one request.
-func (c *Client) send(ctx context.Context, method, path string, payload []byte, headers map[string]string, policy RetryPolicy) ([]byte, string, error) {
+func (c *Client) send(ctx context.Context, method, path string, payload *payload, headers map[string]string, policy RetryPolicy) ([]byte, string, error) {
 	endpoint := method + " " + path
 	// Transports may echo header values into their errors; mask every
 	// credential we send before an error reaches logs or callers.
@@ -511,11 +658,11 @@ func (c *Client) send(ctx context.Context, method, path string, payload []byte, 
 
 // do performs one HTTP attempt and returns the 2xx body and request id.
 // Transport errors pass through redact before they are returned or logged.
-func (c *Client) do(ctx context.Context, method, path string, payload []byte, headers map[string]string, attempt int, redact redactor) ([]byte, string, error) {
+func (c *Client) do(ctx context.Context, method, path string, payload *payload, headers map[string]string, attempt int, redact redactor) ([]byte, string, error) {
 	endpoint := method + " " + path
 	var reader io.Reader
 	if payload != nil {
-		reader = bytes.NewReader(payload)
+		reader = bytes.NewReader(payload.body)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
@@ -536,7 +683,10 @@ func (c *Client) do(ctx context.Context, method, path string, payload []byte, he
 	httpReq.Header.Set("X-Typesafe-Sdk", sdkIdentity)
 	httpReq.Header.Set("X-Typesafe-Runtime", runtimeIdentity)
 	if payload != nil {
-		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Content-Type", payload.contentType)
+		if payload.encoding != "" {
+			httpReq.Header.Set("Content-Encoding", payload.encoding)
+		}
 	}
 	if attempt > 0 {
 		httpReq.Header.Set("X-Typesafe-Retry-Count", strconv.Itoa(attempt))

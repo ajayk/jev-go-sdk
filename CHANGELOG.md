@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.3.0 (2026-10-14)
+
+Tracks the official Python SDK v0.7.5, including v0.7.3 and v0.7.4.
+
+### Breaking changes
+
+- A `Noul` (or raw `"noul"` question) with neither instructions nor a described outcome is rejected with `ErrInvalidRequest` before sending; set `Instructions`, `True`, or `False`.
+
+### Features
+
+- `Image` assets from bytes (`NewImage`), files (`ImageFromFile`), base64 text (`ImageFromBase64`), and `image.Image` values (`EncodeImage`, JPEG or PNG). Images can be placed directly in content, listed in the new `Request.Assets` under an alias, or referenced in text while attached with `Client.AttachAssets`. Requests that carry images are sent as `multipart/form-data`; each image is read once and reused.
+- `Box` questions and `BoxAnswer` (box edges as fractions of the image, and an optional confidence), with `Response.Box` and `Response.Boxes`. Raw `"box"` questions are supported too.
+- `WithCompression(encoding, fn)` compresses request bodies of 1 KiB or more. The Python SDK compresses with zstd by default; the Go standard library has no zstd, so this SDK stays dependency-free and leaves compression off unless you plug in a compressor such as `github.com/klauspost/compress/zstd`. `Content-Encoding` is now a protected header.
+
+### Bug fixes
+
+- NaN and infinite floats in the state, question content, raw questions, and `Request.Extra` are sent as the strings `"NaN"`, `"Infinity"`, and `"-Infinity"` instead of failing to encode. Maps, slices, and arrays are converted; structs are left to `encoding/json`.
+
+### Performance
+
+- The default HTTP client's transport is a clone of `http.DefaultTransport` that keeps up to 100 idle connections per host alive for 30 seconds (instead of 2 per host), so bursts of concurrent calls reuse connections rather than opening new TLS connections.
+
+### Documentation
+
+- Document images, `Box`, request compression, and a Performance section with tips for high-concurrency use.
+
 ## v0.2.2 (2026-09-27)
 
 Tracks the official Python SDK v0.7.2.

@@ -165,7 +165,7 @@ func TestAskRawReturnsUndecodedBody(t *testing.T) {
 		w.Header().Set(RequestIDHeader, "raw-1")
 		_, _ = w.Write([]byte(`{"model":"jev-1.13.0","answers":{"exfil":{"type":"noul","noul":0.5,"future_field":1}},"usage":{"input_tokens":1,"output_tokens":1}}`))
 	})
-	req := Request{State: "s", Questions: map[string]Question{"exfil": Noul{}}}
+	req := Request{State: "s", Questions: map[string]Question{"exfil": Noul{Instructions: "?"}}}
 	body, requestID, err := client.AskRaw(t.Context(), req)
 	if err != nil {
 		t.Fatalf("AskRaw: %v", err)
@@ -211,14 +211,14 @@ func TestAskRejectsInvalidRequestBeforeSending(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	client := newServer(t, func(http.ResponseWriter, *http.Request) { calls.Add(1) })
-	q := map[string]Question{"q": Noul{}}
+	q := map[string]Question{"q": Noul{Instructions: "?"}}
 	tests := []struct {
 		name string
 		req  Request
 	}{
 		{"nil state", Request{Questions: q}},
 		{"no questions", Request{State: "s"}},
-		{"empty id", Request{State: "s", Questions: map[string]Question{"": Noul{}}}},
+		{"empty id", Request{State: "s", Questions: map[string]Question{"": Noul{Instructions: "?"}}}},
 		{"nil question", Request{State: "s", Questions: map[string]Question{"q": nil}}},
 		{"nil pointer question", Request{State: "s", Questions: map[string]Question{"q": (*Noul)(nil)}}},
 		{"no options", Request{State: "s", Questions: map[string]Question{"q": Choice{}}}},
@@ -227,6 +227,16 @@ func TestAskRejectsInvalidRequestBeforeSending(t *testing.T) {
 		{"raw unknown type", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "rank"}}}},
 		{"raw choice without criteria", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "choice"}}}},
 		{"raw score criteria not array", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "score", "criteria": map[string]any{}}}}},
+		{"empty noul", Request{State: "s", Questions: map[string]Question{"q": Noul{}}}},
+		{"raw empty noul", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "noul"}}}},
+		{"raw noul with undescribed outcomes", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "noul", "criteria": map[string]any{"true": nil, "false": nil}}}}},
+		{"raw noul criteria not object", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "noul", "criteria": "spam"}}}},
+		{"raw empty choice criteria", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "choice", "criteria": map[string]any{}}}}},
+		{"raw empty score criteria", Request{State: "s", Questions: map[string]Question{"q": Raw{"type": "score", "criteria": []any{}}}}},
+		{"empty asset alias", Request{State: "s", Questions: q, Assets: map[string]*Image{" ": NewImage([]byte("x"))}}},
+		{"nil asset", Request{State: "s", Questions: q, Assets: map[string]*Image{"<photo>": nil}}},
+		{"empty image", Request{State: "s", Questions: q, Assets: map[string]*Image{"<photo>": NewImage(nil)}}},
+		{"unreadable image file", Request{State: "s", Questions: q, Assets: map[string]*Image{"<photo>": ImageFromFile("testdata/missing.png")}}},
 		{"bad per-call retry", Request{State: "s", Questions: q, Retry: &RetryPolicy{Jitter: 2}}},
 	}
 	for _, tt := range tests {
@@ -659,15 +669,29 @@ func TestAskOverHTTP2(t *testing.T) {
 	}
 }
 
-func TestDefaultHTTPClientNegotiatesHTTP2(t *testing.T) {
+func TestDefaultHTTPClientTransport(t *testing.T) {
 	t.Parallel()
 	client, err := NewClient(WithAPIKey("k"))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	// A nil Transport means http.DefaultTransport, which negotiates HTTP/2
-	// over TLS. A custom transport here would silently fall back to HTTP/1.1.
-	if client.httpClient.Transport != nil {
-		t.Errorf("default http.Client transport: got = %T, want nil (http.DefaultTransport)", client.httpClient.Transport)
+	tr, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("default http.Client transport: got = %T, want *http.Transport", client.httpClient.Transport)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("default transport is http.DefaultTransport itself, want a clone")
+	}
+	// A transport not cloned from http.DefaultTransport would silently fall
+	// back to HTTP/1.1.
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("default transport: ForceAttemptHTTP2 = false, want true")
+	}
+	if tr.MaxIdleConns != 100 || tr.MaxIdleConnsPerHost != 100 || tr.IdleConnTimeout != 30*time.Second {
+		t.Errorf("default transport pool: got = (MaxIdleConns %d, MaxIdleConnsPerHost %d, IdleConnTimeout %v), want = (100, 100, 30s)",
+			tr.MaxIdleConns, tr.MaxIdleConnsPerHost, tr.IdleConnTimeout)
+	}
+	if tr.Proxy == nil {
+		t.Error("default transport dropped http.DefaultTransport's proxy settings")
 	}
 }

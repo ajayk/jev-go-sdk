@@ -9,9 +9,12 @@ import (
 	"fmt"
 )
 
-// Content is the JSON content the API accepts for a state, an instruction, or
-// a criteria description: a Go string, or any value that marshals to a JSON
-// object or array. Other JSON kinds are rejected by the API with a 422.
+// Content is the content the API accepts for a state, an instruction, or a
+// criteria description: a Go string, an [*Image], or any value that marshals
+// to a JSON object or array, which may itself hold images. Other JSON kinds
+// are rejected by the API with a 422. NaN and infinite floats inside maps,
+// slices, and arrays are sent as the strings "NaN", "Infinity", and
+// "-Infinity".
 type Content any
 
 // Wire question kinds, also carried on every answer.
@@ -19,14 +22,15 @@ const (
 	KindNoul   = "noul"
 	KindChoice = "choice"
 	KindScore  = "score"
+	KindBox    = "box"
 )
 
-// Question is one typed question: a [Noul], [Choice], or [Score] by value or
-// pointer, or a [Raw] JSON object. The interface is sealed so the response
+// Question is one typed question: a [Noul], [Choice], [Score], or [Box] by
+// value or pointer, or a [Raw] JSON object. The interface is sealed so the response
 // validator can match every answer to the exact question that produced it.
 type Question interface {
 	json.Marshaler
-	// Kind returns the wire kind: "noul", "choice", or "score".
+	// Kind returns the wire kind: "noul", "choice", "score", or "box".
 	Kind() string
 	validate() error
 }
@@ -37,12 +41,19 @@ type wireQuestion struct {
 	Criteria     any     `json:"criteria,omitempty"`
 }
 
+func (w wireQuestion) marshal() ([]byte, error) {
+	w.Instructions, w.Criteria = stringifyNonFinite(w.Instructions), stringifyNonFinite(w.Criteria)
+	return json.Marshal(w)
+}
+
 // Noul asks a yes/no question. The answer is the probability of yes; there is
 // no separate confidence because the probability already is one.
 type Noul struct {
-	// Instructions is the question or statement to evaluate. Optional.
+	// Instructions is the question or statement to evaluate. Optional when
+	// True or False describes an outcome.
 	Instructions Content
-	// True and False optionally describe what a yes and a no mean.
+	// True and False optionally describe what a yes and a no mean. At least
+	// one of them is required when Instructions is nil.
 	True  Content
 	False Content
 }
@@ -52,7 +63,12 @@ var _ Question = (*Noul)(nil)
 // Kind returns "noul".
 func (Noul) Kind() string { return KindNoul }
 
-func (Noul) validate() error { return nil }
+func (q Noul) validate() error {
+	if q.Instructions == nil && q.True == nil && q.False == nil {
+		return errors.New("noul needs instructions or a described outcome")
+	}
+	return nil
+}
 
 // MarshalJSON encodes the question in the wire shape.
 func (q Noul) MarshalJSON() ([]byte, error) {
@@ -67,7 +83,7 @@ func (q Noul) MarshalJSON() ([]byte, error) {
 		}
 		w.Criteria = criteria
 	}
-	return json.Marshal(w)
+	return w.marshal()
 }
 
 // Choice picks one label from a set of alternatives. The answer names the
@@ -100,7 +116,7 @@ func (q Choice) validate() error {
 
 // MarshalJSON encodes the question in the wire shape.
 func (q Choice) MarshalJSON() ([]byte, error) {
-	return json.Marshal(wireQuestion{Type: KindChoice, Instructions: q.Instructions, Criteria: q.Options})
+	return wireQuestion{Type: KindChoice, Instructions: q.Instructions, Criteria: q.Options}.marshal()
 }
 
 // Score rates the state on an ordered rubric. The answer is a weighted
@@ -133,13 +149,34 @@ func (q Score) validate() error {
 
 // MarshalJSON encodes the question in the wire shape.
 func (q Score) MarshalJSON() ([]byte, error) {
-	return json.Marshal(wireQuestion{Type: KindScore, Instructions: q.Instructions, Criteria: q.Levels})
+	return wireQuestion{Type: KindScore, Instructions: q.Instructions, Criteria: q.Levels}.marshal()
+}
+
+// Box locates what its instructions describe in the request's image. The
+// answer is the box's edges as fractions of the image's size. It needs an
+// image in the request and a vision-language model.
+type Box struct {
+	// Instructions describes what to locate. Optional.
+	Instructions Content
+}
+
+var _ Question = (*Box)(nil)
+
+// Kind returns "box".
+func (Box) Kind() string { return KindBox }
+
+func (Box) validate() error { return nil }
+
+// MarshalJSON encodes the question in the wire shape.
+func (q Box) MarshalJSON() ([]byte, error) {
+	return wireQuestion{Type: KindBox, Instructions: q.Instructions}.marshal()
 }
 
 // Raw is a question given as its JSON object, for callers that build
 // questions dynamically or load them from configuration. It must carry a
-// "type" of "noul", "choice", or "score"; "choice" needs an object under
-// "criteria" and "score" an array. It is converted to the matching typed
+// "type" of "noul", "choice", "score", or "box"; "choice" needs an object
+// under "criteria" and "score" an array, and "noul" needs "instructions" or a
+// described outcome. It is converted to the matching typed
 // question before sending, so answers are validated exactly as for one.
 type Raw map[string]any
 
@@ -152,12 +189,17 @@ func (q Raw) Kind() string {
 }
 
 func (q Raw) validate() error {
-	_, err := q.typed()
-	return err
+	typed, err := q.typed()
+	if err != nil {
+		return err
+	}
+	return typed.validate()
 }
 
 // MarshalJSON encodes the object as given.
-func (q Raw) MarshalJSON() ([]byte, error) { return json.Marshal(map[string]any(q)) }
+func (q Raw) MarshalJSON() ([]byte, error) {
+	return json.Marshal(stringifyNonFinite(map[string]any(q)))
+}
 
 // typed converts the object into the typed question it describes.
 func (q Raw) typed() (Question, error) {
@@ -203,6 +245,8 @@ func (q Raw) typed() (Question, error) {
 			levels[i] = level
 		}
 		return Score{Instructions: instructions, Levels: levels}, nil
+	case KindBox:
+		return Box{Instructions: instructions}, nil
 	case "":
 		return nil, errors.New(`raw question needs a nonempty string "type"`)
 	default:
@@ -215,7 +259,7 @@ func (q Raw) typed() (Question, error) {
 // converted; a nil pointer or a foreign implementation is rejected.
 func normalizeQuestion(question Question) (Question, error) {
 	switch q := question.(type) {
-	case Noul, Choice, Score:
+	case Noul, Choice, Score, Box:
 		return q, nil
 	case *Noul:
 		if q == nil {
@@ -230,6 +274,11 @@ func normalizeQuestion(question Question) (Question, error) {
 	case *Score:
 		if q == nil {
 			return nil, errors.New("question is a nil *Score")
+		}
+		return *q, nil
+	case *Box:
+		if q == nil {
+			return nil, errors.New("question is a nil *Box")
 		}
 		return *q, nil
 	case Raw:
