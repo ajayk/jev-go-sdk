@@ -4,22 +4,29 @@
 // Package jev is a dependency-free Go client for TypeSafe AI's API and its
 // flagship System One model, Jev.
 //
-// A System One call sends one state (text or JSON) together with a map of
+// A System One call sends one state (text, JSON, or images) together with a map of
 // typed questions, and receives one calibrated, probability-bearing answer per
 // question. There is no generated text, no conversation, and no tool calling:
 // the request is a function call and the answers are values your code can
 // branch on directly.
 //
-// Three question primitives exist:
+// Four question primitives exist:
 //
 //   - [Noul] asks a yes/no question and yields the probability of yes.
 //   - [Choice] picks one label from a described set and yields the label, a
 //     probability per label, and a confidence.
 //   - [Score] rates the state on an ordered rubric and yields the weighted
 //     position, a probability per level, and a confidence.
+//   - [Box] locates something in the request's image and yields the box's
+//     edges and a confidence.
 //
 // [Raw] carries a question as a plain JSON object for callers that build
 // questions dynamically.
+//
+// Images are sent as [*Image] assets: placed directly in content, listed in
+// Request.Assets under an alias, or referenced in text while attached with
+// [Client.AttachAssets]. Requests that carry images are sent as
+// multipart/form-data.
 //
 // Questions in one request are evaluated independently against the same
 // state, so one answer never conditions another. Every response is checked

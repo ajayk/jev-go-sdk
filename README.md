@@ -4,7 +4,7 @@ A dependency-free Go client for [TypeSafe AI](https://typesafe.ai)'s API and
 its flagship System One model, **Jev**. It mirrors the feature surface of the
 official Python and JavaScript SDKs.
 
-Jev is not a chat model. You send it a *state* (text or JSON) and a set of
+Jev is not a chat model. You send it a *state* (text, JSON, or images) and a set of
 *typed questions*; it returns one calibrated, probability-bearing answer per
 question in a few hundred milliseconds. No generated text, no tool loop, no
 prompt parsing: the answers are values your code can branch on directly.
@@ -54,19 +54,68 @@ urgency, _ := resp.Score("urgency") // urgency.Score, urgency.Level(), urgency.L
 
 Every question in a request is evaluated independently against the same state,
 so ask several at once rather than chaining calls. `resp.Nouls()`,
-`resp.Choices()`, and `resp.Scores()` return the answers grouped by kind.
+`resp.Choices()`, `resp.Scores()`, and `resp.Boxes()` return the answers
+grouped by kind.
 
 ## Question types
 
 | Type | Ask | Get back |
 | --- | --- | --- |
-| `jev.Noul` | a yes/no question or statement, with optional descriptions of what yes and no mean | `NoulAnswer{Probability}`: the probability of yes |
+| `jev.Noul` | a yes/no question or statement, with optional descriptions of what yes and no mean (instructions, a description, or both are required) | `NoulAnswer{Probability}`: the probability of yes |
 | `jev.Choice` | pick one label from a described set (up to 255) | `ChoiceAnswer{Choice, Probabilities, Confidence}` |
 | `jev.Score` | rate the state on an ordered rubric, lowest level first | `ScoreAnswer{Score, Probabilities, Legend, Confidence}`; `Level()` gives the most probable level index |
+| `jev.Box` | locate what the instructions describe in the request's image | `BoxAnswer{Box, Confidence}`: the box's `Top`, `Bottom`, `Left`, `Right` edges as fractions of the image, and a confidence (nil when the model gives none) |
 | `jev.Raw` | a question as a plain JSON object with a `"type"` key, for dynamically built questions | the answer for whichever type it names |
 
 `Instructions`, option descriptions, rubric levels, and `State` accept a Go
-string or any value that marshals to a JSON object or array (`jev.Content`).
+string, an image, or any value that marshals to a JSON object or array
+(`jev.Content`). NaN and infinite floats inside maps, slices, and arrays are
+sent as the strings `"NaN"`, `"Infinity"`, and `"-Infinity"`, since JSON has no
+tokens for them.
+
+## Images
+
+Image assets need a vision-language model. Build an image from bytes, a file,
+base64 text, or an `image.Image`:
+
+```go
+photo := jev.ImageFromFile("photos/product.png") // read once, on first use
+scan := jev.NewImage(data)                        // image file bytes
+upload, err := jev.ImageFromBase64(text)          // base64 text
+chart, err := jev.EncodeImage(img, "png")         // an image.Image, as "jpeg" or "png"
+```
+
+Then send it in any of three ways:
+
+```go
+// 1. Place it directly in content: the state, instructions, or criteria.
+resp, err := client.Ask(ctx, jev.Request{
+    State:     photo,
+    Questions: map[string]jev.Question{"dog": jev.Box{Instructions: "The dog"}},
+    Model:     jev.ModelJevPreview,
+})
+
+// 2. Refer to it by an alias in text, listing it in Assets.
+resp, err := client.Ask(ctx, jev.Request{
+    State:     "Product photo: <photo>",
+    Assets:    map[string]*jev.Image{"<photo>": photo},
+    Questions: map[string]jev.Question{"damaged": jev.Noul{Instructions: "Is the product damaged?"}},
+})
+
+// 3. Refer to it inside text through its String form, while attached.
+detach := client.AttachAssets(photo)
+defer detach()
+resp, err := client.Ask(ctx, jev.Request{
+    State:     fmt.Sprintf("Product photo: %s", photo),
+    Questions: map[string]jev.Question{"damaged": jev.Noul{Instructions: "Is the product damaged?"}},
+})
+```
+
+A reference to an image that is neither placed, listed in `Assets`, nor
+attached is sent as plain text, without the image. Requests that carry images
+are sent as `multipart/form-data`, with the JSON body as the first part and
+each image's raw bytes as its own part. An `*Image` is read once and reused by
+every request that sends it.
 
 ## Configuration
 
@@ -83,8 +132,9 @@ Options win over environment variables; blank environment values are ignored.
 | `WithRetryPolicy(p)` | | `jev.DefaultRetryPolicy()` |
 | `WithMaxResponseBytes(n)` | | 16 MiB |
 | `WithLogger(*slog.Logger)` | | no logging |
+| `WithCompression(encoding, fn)` | | bodies sent uncompressed |
 
-Per call, `Request` carries `Model`, `Headers`, `Extra` (additional top-level
+Per call, `Request` carries `Model`, `Assets`, `Headers`, `Extra` (additional top-level
 body fields for API features this SDK does not model yet), and `Retry`. Bound a
 whole call, including retries, with the context you pass to `Ask`.
 
@@ -92,12 +142,41 @@ whole call, including retries, with the context you pass to `Ask`.
 account. `client.AskRaw(ctx, req)` returns the undecoded 2xx body for callers
 who model the response themselves.
 
+## Request compression
+
+The official SDKs compress request bodies of 1 KiB or more with zstd by
+default. The Go standard library has no zstd, so this SDK sends bodies
+uncompressed unless you plug in a compressor, for example
+[klauspost/compress](https://github.com/klauspost/compress):
+
+```go
+encoder, _ := zstd.NewWriter(nil) // safe for concurrent EncodeAll
+client, err := jev.NewClient(jev.WithCompression("zstd", func(body []byte) ([]byte, error) {
+    return encoder.EncodeAll(body, nil), nil
+}))
+```
+
+The body is compressed once per call and reused by every retry. Compression
+helps most with large states and images. Other APIs, such as some gateways,
+may not accept compressed bodies yet.
+
+## Performance
+
+For high-concurrency use, share one `Client` across goroutines; it is safe for
+concurrent use and pools connections. The default client keeps up to 100 idle
+connections per host alive for 30 seconds, so bursts of concurrent calls reuse
+connections instead of opening new ones with fresh TLS handshakes
+(`http.DefaultTransport` keeps only 2 per host). If you supply your own
+transport, raise `MaxIdleConnsPerHost` to match your concurrency. Ask several
+questions in one request rather than one request per question, and consider
+HTTP/2 and compression, below and above.
+
 ## HTTP/2
 
 HTTP/2 multiplexes many concurrent requests over one connection, which helps
 when you fan out calls from several goroutines. Unlike the Python SDK, no extra
-dependency is needed: the default client uses `http.DefaultTransport`, which
-negotiates HTTP/2 over TLS automatically. If you supply your own transport,
+dependency is needed: the default client's transport is cloned from
+`http.DefaultTransport`, which negotiates HTTP/2 over TLS automatically. If you supply your own transport,
 keep HTTP/2 enabled:
 
 ```go
@@ -191,7 +270,8 @@ redact secrets before calling.
 
 ## API limits (as documented by TypeSafe)
 
-- Text only: a string, a JSON object, or a JSON array. No images or audio.
+- State is a string, a JSON object, or a JSON array, which can reference
+  images. Images need a vision-language model; no audio.
 - About 64k tokens per request, with state plus the longest single question
   within about 32k tokens.
 - Input tokens are billed; output is free.
